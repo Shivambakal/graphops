@@ -235,3 +235,167 @@ def test_api_blast_radius_for_real_node(client):
 def test_api_blast_radius_unknown_node_is_404(client):
     r = client.post("/blast-radius", json={"node_id": "host:nope"})
     assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# 6. Analyst decision gate (graceful when Supabase is not configured)
+# ---------------------------------------------------------------------------
+
+def test_decision_endpoint_validates_input(client):
+    r = client.post("/decisions", json={
+        "node_id": "host:ws-007", "action": "isolate_host",
+        "target": "host:ws-007", "decision": "maybe",
+    })
+    assert r.status_code == 400
+
+
+def test_decision_endpoint_accepts_approve_and_reject(client):
+    for d in ("approved", "rejected"):
+        r = client.post("/decisions", json={
+            "node_id": "host:ws-007", "action": "isolate_host",
+            "target": "host:ws-007", "decision": d,
+            "rationale": "test",
+        })
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is True
+        # no SUPABASE_URL in test env -> not persisted, but never an error
+        assert body["stored"] is False
+
+
+def test_decisions_list_degrades_gracefully(client):
+    r = client.get("/decisions")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["decisions"] == []
+    assert body["persisted"] is False
+
+
+def test_hunt_runs_list_degrades_gracefully(client):
+    r = client.get("/hunt-runs")
+    assert r.status_code == 200
+    assert r.json()["hunt_runs"] == []
+
+
+# ---------------------------------------------------------------------------
+# 7. Edge cases: blast-radius scoring boundaries (QA specialist additions)
+# ---------------------------------------------------------------------------
+
+def _chain_graph(n: int = 6) -> GraphEngine:
+    """Linear chain host:h0 -> host:h1 -> ... -> host:h{n-1}."""
+    eng = GraphEngine()
+    for i in range(n):
+        eng.add_entity("host", f"h{i}")
+    for i in range(n - 1):
+        eng.add_event(f"host:h{i}", f"host:h{i+1}", "network", float(i))
+    return eng
+
+
+def test_blast_radius_max_hops_cutoff_excludes_distant_nodes():
+    eng = _chain_graph(6)
+    radius = eng.blast_radius("host:h0", max_hops=2)
+    distances = {nid: info["distance"] for nid, info in radius.items()}
+    assert distances == {"host:h0": 0, "host:h1": 1, "host:h2": 2}
+    assert "host:h3" not in radius  # beyond cutoff must be absent, not just far
+
+
+def test_blast_radius_severity_boost_clamped_at_100():
+    eng = _chain_graph(3)
+    eng.graph.nodes["host:h0"]["severity"] = "critical"  # 100 + 25 -> clamp 100
+    eng.graph.nodes["host:h1"]["severity"] = "high"      # 60 + 25 = 85
+    radius = eng.blast_radius("host:h0", max_hops=2)
+    assert radius["host:h0"]["risk_score"] == pytest.approx(100.0)
+    assert radius["host:h1"]["risk_score"] == pytest.approx(85.0)
+    assert radius["host:h2"]["risk_score"] == pytest.approx(36.0)  # 100*0.6^2, no boost
+
+
+def test_blast_radius_isolated_node_returns_only_itself():
+    eng = GraphEngine()
+    eng.add_entity("host", "lonely")
+    eng.add_entity("host", "other")
+    radius = eng.blast_radius("host:lonely", max_hops=4)
+    assert list(radius.keys()) == ["host:lonely"]
+    assert radius["host:lonely"]["distance"] == 0
+    assert radius["host:lonely"]["risk_score"] == pytest.approx(100.0)
+
+
+def test_blast_radius_zero_hops_returns_source_only():
+    eng = _chain_graph(4)
+    radius = eng.blast_radius("host:h1", max_hops=0)
+    assert list(radius.keys()) == ["host:h1"]
+    assert radius["host:h1"]["distance"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 8. Edge cases: hunt query boundaries (QA specialist additions)
+# ---------------------------------------------------------------------------
+
+def test_hunt_beaconing_ignores_rfc1918_even_when_suspicious():
+    eng = GraphEngine()
+    eng.add_entity("host", "h1")
+    eng.add_entity("ip", "192.168.1.5")
+    eng.add_entity("ip", "203.0.113.9")
+    eng.add_event("host:h1", "ip:192.168.1.5", "network", 1.0,
+                  attrs={"suspicious": True})
+    eng.add_event("host:h1", "ip:203.0.113.9", "network", 2.0,
+                  attrs={"suspicious": True})
+    findings = hunt_beaconing(eng)
+    hit = {n for f in findings for n in f["nodes"]}
+    assert "ip:203.0.113.9" in hit, "external suspicious IP must be flagged"
+    assert "ip:192.168.1.5" not in hit, "RFC-1918 IP must never be flagged"
+
+
+def _travel_graph(events) -> GraphEngine:
+    """events: list of (ip_eid, geo, ts)."""
+    eng = GraphEngine()
+    eng.add_entity("user", "u1")
+    for eid, geo, ts in events:
+        eng.add_entity("ip", eid, attrs={"geo": geo})
+        eng.add_event("user:u1", f"ip:{eid}", "auth", ts)
+    return eng
+
+
+def test_hunt_impossible_travel_same_geo_no_finding():
+    eng = _travel_graph([("1.1.1.1", "US", 1000.0), ("2.2.2.2", "US", 1100.0)])
+    assert hunt_impossible_travel(eng) == []
+
+
+def test_hunt_impossible_travel_outside_window_no_finding():
+    # 8000s apart > 3600s window -> no finding even with distinct geos
+    eng = _travel_graph([("1.1.1.1", "US", 1000.0), ("2.2.2.2", "EU", 9000.0)])
+    assert hunt_impossible_travel(eng) == []
+
+
+def test_hunt_impossible_travel_positive_control():
+    eng = _travel_graph([("1.1.1.1", "US", 1000.0), ("2.2.2.2", "EU", 1500.0)])
+    findings = hunt_impossible_travel(eng)
+    assert len(findings) == 1
+    assert findings[0]["severity"] == "high"  # dt=500s < 900s
+    assert "user:u1" in findings[0]["nodes"]
+
+
+# ---------------------------------------------------------------------------
+# 9. Edge cases: containment caps + API input validation (QA additions)
+# ---------------------------------------------------------------------------
+
+def test_containment_actions_capped_at_max_actions():
+    from graphops.response.contain import MAX_ACTIONS
+    eng = GraphEngine()
+    eng.add_entity("host", "c0")
+    for i in range(40):
+        eng.add_entity("host", f"w{i}")
+        eng.add_event("host:c0", f"host:w{i}", "smb", float(i),
+                      attrs={"suspicious": True})
+    result = recommend_containment(eng, "host:c0")
+    assert len(result["actions"]) <= MAX_ACTIONS
+    assert len(result["actions"]) == MAX_ACTIONS  # 41 candidates, capped at 25
+
+
+def test_api_blast_radius_malformed_body_is_422(client):
+    r = client.post("/blast-radius", json={})
+    assert r.status_code == 422  # node_id is required
+
+
+def test_api_blast_radius_empty_string_node_is_404(client):
+    r = client.post("/blast-radius", json={"node_id": ""})
+    assert r.status_code == 404
