@@ -386,6 +386,98 @@ def list_hunt_runs(limit: int = 20):
 
 
 # ---------------------------------------------------------------------------
+# Real telemetry ingestion — raw logs in, dynamic graph out.
+# POST /ingest accepts CSV or JSON log telemetry (Sysmon / 4624 style),
+# builds the graph from the logs alone (zero hardcoded topology), and
+# stores it for the telemetry hunts below.
+# ---------------------------------------------------------------------------
+_INGESTED_GRAPH = None
+_INGESTED_META = {}
+
+
+class IngestRequest(BaseModel):
+    logs: str  # raw CSV or JSON text
+    format: str = "auto"  # csv | json | auto
+
+
+@app.post("/ingest")
+def ingest_logs(req: IngestRequest):
+    global _INGESTED_GRAPH, _INGESTED_META
+    try:
+        from graphops.engine.parser import ingest as _ingest, build_graph as _build
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="ingestion engine unavailable")
+    fmt = req.format if req.format in ("csv", "json") else None
+    try:
+        events = _ingest(req.logs, fmt=fmt)
+        G = _build(events)
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(status_code=400, detail="failed to parse logs")
+    _INGESTED_GRAPH = G
+    _INGESTED_META = {"events": len(events), "nodes": G.number_of_nodes(),
+                      "edges": G.number_of_edges()}
+    return {"ok": True, **_INGESTED_META}
+
+
+def _telemetry_graph():
+    # ingested telemetry wins; fall back to the demo engine graph
+    if _INGESTED_GRAPH is not None:
+        return _INGESTED_GRAPH
+    try:
+        g = getattr(engine, "graph", None)
+        if callable(g):
+            g = g()
+        return g
+    except Exception:
+        return None
+
+
+@app.post("/hunt/beaconing")
+def hunt_beaconing():
+    try:
+        from graphops.engine.beaconing import detect_beaconing as _detect
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="beaconing engine unavailable")
+    G = _telemetry_graph()
+    if G is None:
+        raise HTTPException(status_code=400, detail="no graph: POST /ingest first")
+    return {"findings": _detect(G), "ingested": _INGESTED_GRAPH is not None}
+
+
+@app.post("/hunt/lateral")
+def hunt_lateral():
+    try:
+        from graphops.hunt.queries import hunt_lateral_movement_telemetry as _hunt
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="lateral-movement engine unavailable")
+    G = _telemetry_graph()
+    if G is None:
+        raise HTTPException(status_code=400, detail="no graph: POST /ingest first")
+    return {"findings": _hunt(G), "ingested": _INGESTED_GRAPH is not None}
+
+
+class PrivilegePathRequest(BaseModel):
+    source: str  # e.g. "host:ws-107"
+
+
+@app.post("/hunt/privilege-paths")
+def hunt_privilege_paths(req: PrivilegePathRequest):
+    try:
+        from graphops.engine.privilege import privilege_weighted_paths as _paths
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="privilege engine unavailable")
+    G = _telemetry_graph()
+    if G is None:
+        raise HTTPException(status_code=400, detail="no graph: POST /ingest first")
+    return {"paths": _paths(G, req.source), "ingested": _INGESTED_GRAPH is not None}
+
+
+# ---------------------------------------------------------------------------
 # Serve the dashboard UI from the same process (Docker / Render / Fly /
 # Hugging Face single-container deploys). API routes registered above take
 # precedence; this mount is the LAST route and only a fallback for "/".

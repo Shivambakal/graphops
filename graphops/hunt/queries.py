@@ -25,6 +25,14 @@ from typing import Any, Dict, List, Optional
 
 def _get_graph(engine: Any):
     """Return the underlying networkx DiGraph or None."""
+    # tolerate a raw networkx graph passed directly (parser-built telemetry)
+    try:
+        import networkx as _nx
+
+        if isinstance(engine, _nx.Graph):
+            return engine
+    except Exception:
+        pass
     g = getattr(engine, "graph", None)
     if g is None:
         return None
@@ -632,6 +640,100 @@ def hunt_impossible_travel(engine: Any) -> List[Dict[str, Any]]:
                 "severity": severity,
                 "evidence": evidence,
                 "nodes": [user, dst_a, dst_b],
+            }
+        )
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# hunt: lateral movement from raw telemetry (parser-built graphs)
+# ---------------------------------------------------------------------------
+
+_ADMIN_SHARES = {"C$", "ADMIN$", "IPC$"}
+
+
+def _edge_share(info: Dict[str, Any]) -> Optional[str]:
+    share = info.get("share")
+    if share is None:
+        return None
+    s = str(share).strip().upper()
+    return s or None
+
+
+def hunt_lateral_movement_telemetry(engine: Any) -> List[Dict[str, Any]]:
+    """Detect lateral movement from raw log telemetry.
+
+    Works on parser-built graphs (edges carry ``logon_type`` / ``share`` /
+    ``etype="logon"`` from Windows 4624 / Sysmon events).  Flags:
+
+    - Logon Type 3 (network logon) between two workstations/endpoints.
+      Admins log on to servers, not workstation-to-workstation — a Type 3
+      hop between endpoints is a classic lateral-movement signal.
+    - Any edge involving administrative shares (C$, ADMIN$, IPC$).
+
+    Tagged MITRE T1021.002 (SMB/Windows Admin Shares).  No hostnames,
+    users, or shares are hardcoded; everything derives from edge attrs.
+    """
+    G = _get_graph(engine)
+    if G is None:
+        return []
+    try:
+        from graphops.engine.privilege import asset_tier
+    except Exception:
+        asset_tier = None  # type: ignore
+
+    def _tier(n: Any) -> int:
+        if asset_tier is not None:
+            try:
+                return asset_tier(G, n)
+            except Exception:
+                pass
+        return 2
+
+    findings: List[Dict[str, Any]] = []
+    try:
+        edges = list(G.edges())
+    except Exception:
+        return []
+    for src, dst in edges:
+        if _node_type(src) != "host" or _node_type(dst) != "host":
+            continue
+        info = _edge_info(G, src, dst)
+        logon_type = info.get("logon_type")
+        try:
+            logon_type = int(str(logon_type)) if logon_type is not None else None
+        except (TypeError, ValueError):
+            logon_type = None
+        share = _edge_share(info)
+        admin_share = share in _ADMIN_SHARES
+
+        ws_to_ws_type3 = (
+            logon_type == 3 and _tier(src) == 2 and _tier(dst) == 2
+        )
+        if not ws_to_ws_type3 and not admin_share:
+            continue
+
+        ts = info.get("ts") or info.get("timestamp")
+        evidence: List[str] = []
+        if ws_to_ws_type3:
+            evidence.append(
+                f"{src} -> {dst} at {_fmt_ts(ts)}: network logon (Type 3) "
+                f"between two workstations — atypical for legitimate "
+                f"administration (MITRE T1021.002)"
+            )
+        if admin_share:
+            evidence.append(
+                f"{src} -> {dst} at {_fmt_ts(ts)}: administrative share "
+                f"{share} accessed (MITRE T1021.002)"
+            )
+        severity = "critical" if (ws_to_ws_type3 and admin_share) else "high"
+        findings.append(
+            {
+                "title": f"Lateral movement (T1021.002): {src} -> {dst}",
+                "severity": severity,
+                "evidence": evidence,
+                "nodes": [src, dst],
+                "mitre": ["T1021.002"],
             }
         )
     return findings
