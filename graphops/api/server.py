@@ -266,6 +266,46 @@ def hunt():
     return {"findings": findings}
 
 
+@app.post("/hunt/privilege-escalation")
+def hunt_privilege_escalation():
+    findings = []
+    try:
+        from graphops.hunt.queries import hunt_privilege_escalation as _h
+        res = _h(engine)
+        if res:
+            findings.extend(res if isinstance(res, list) else [res])
+    except Exception:
+        traceback.print_exc()
+    return {"findings": findings}
+
+
+@app.post("/hunt/data-staging")
+def hunt_data_staging():
+    findings = []
+    try:
+        from graphops.hunt.queries import hunt_data_staging as _h
+        res = _h(engine)
+        if res:
+            findings.extend(res if isinstance(res, list) else [res])
+    except Exception:
+        traceback.print_exc()
+    return {"findings": findings}
+
+
+class RedteamRequest(BaseModel):
+    seed: int = 42
+
+
+@app.post("/redteam/replay")
+def redteam_replay(req: RedteamRequest):
+    try:
+        from graphops.redteam.replay import replay
+        return replay(seed=int(req.seed))
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="redteam replay failed")
+
+
 @app.post("/blast-radius")
 def blast_radius(req: BlastRadiusRequest):
     if req.node_id not in _NODE_INDEX:

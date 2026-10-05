@@ -399,3 +399,168 @@ def test_api_blast_radius_malformed_body_is_422(client):
 def test_api_blast_radius_empty_string_node_is_404(client):
     r = client.post("/blast-radius", json={"node_id": ""})
     assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# 9. New hunts: privilege escalation + data staging
+# ---------------------------------------------------------------------------
+
+def _finding_shape_ok(f):
+    assert isinstance(f, dict)
+    assert isinstance(f.get("title"), str) and f["title"]
+    assert f.get("severity") in ("low", "medium", "high", "critical")
+    assert isinstance(f.get("evidence"), list) and f["evidence"]
+    assert isinstance(f.get("nodes"), list) and f["nodes"]
+
+
+def test_hunt_privilege_escalation_traces_attack_chain():
+    from graphops.hunt.queries import hunt_privilege_escalation
+    engine, _ = generate(seed=42)
+    findings = hunt_privilege_escalation(engine)
+    assert len(findings) == 1
+    f = findings[0]
+    _finding_shape_ok(f)
+    assert f["severity"] == "critical"
+    assert "user:u-0042" in f["nodes"]
+    assert "process:lsass.exe" in f["nodes"]
+    assert any("u-0042" in e and "lsass" in e for e in f["evidence"])
+
+
+def test_hunt_privilege_escalation_group_nesting():
+    from graphops.hunt.queries import hunt_privilege_escalation
+    eng = GraphEngine()
+    eng.add_entity("user", "alice")
+    eng.add_entity("group", "team-a")
+    eng.add_entity("group", "domain-admins", {"admin": True})
+    eng.add_event("user:alice", "group:team-a", "member_of", 1.0)
+    eng.add_event("group:team-a", "group:domain-admins", "member_of", 2.0)
+    findings = hunt_privilege_escalation(eng)
+    assert len(findings) == 1
+    assert findings[0]["severity"] == "high"
+    assert "user:alice" in findings[0]["nodes"]
+    assert "group:domain-admins" in findings[0]["nodes"]
+
+
+def test_hunt_data_staging_correlates_exfiltration():
+    from graphops.hunt.queries import hunt_data_staging
+    engine, _ = generate(seed=42)
+    findings = hunt_data_staging(engine)
+    # exactly one: the 7z staging on ws-031 (powershell noise excluded)
+    assert len(findings) == 1
+    f = findings[0]
+    _finding_shape_ok(f)
+    assert f["severity"] == "critical"
+    assert "host:ws-031" in f["nodes"]
+    assert "process:7z.exe" in f["nodes"]
+    assert "ip:203.0.113.9" in f["nodes"]
+    assert any("exfiltration" in e for e in f["evidence"])
+
+
+def test_new_hunts_defensive_on_empty_engine():
+    from graphops.hunt.queries import hunt_privilege_escalation, hunt_data_staging
+    eng = GraphEngine()
+    assert hunt_privilege_escalation(eng) == []
+    assert hunt_data_staging(eng) == []
+    assert hunt_privilege_escalation(None) == []
+    assert hunt_data_staging(None) == []
+
+
+# ---------------------------------------------------------------------------
+# 10. Red-team replay harness
+# ---------------------------------------------------------------------------
+
+def test_redteam_replay_report_shape():
+    import json
+    from graphops.redteam.replay import replay
+    report = replay(seed=42)
+    json.dumps(report)  # must be JSON-serializable
+    assert report["campaign"] == "GRAPHOPS-DEMO-001"
+    assert len(report["stages"]) == 7
+    assert report["coverage"] == "5/7"
+    assert report["detected"] == 5 and report["missed"] == 2
+    assert report["mttd_seconds"] == 0.0
+    missed = {s["stage"] for s in report["stages"] if s["status"] == "missed"}
+    assert missed == {"phishing", "foothold"}
+    by_stage = {s["stage"]: s for s in report["stages"]}
+    assert by_stage["privilege-escalation"]["detected_by"] == ["privilege_escalation"]
+    assert "beaconing" in by_stage["exfiltration"]["detected_by"]
+
+
+def test_redteam_replay_degrades_without_generator():
+    import graphops.redteam.replay as rp
+    orig = rp.generate
+    rp.generate = None
+    try:
+        report = rp.replay(seed=42)
+        assert report["detected"] == 0
+        assert "error" in report
+    finally:
+        rp.generate = orig
+
+
+# ---------------------------------------------------------------------------
+# 11. Neo4j Aura client
+# ---------------------------------------------------------------------------
+
+def test_neo4j_client_configured_and_roundtrip():
+    from graphops.store import neo4j_client as n4
+    pytest.importorskip("urllib.request")
+    if not n4.is_configured():
+        pytest.skip("Neo4j credentials not available")
+    rows = n4.run_cypher("RETURN 1 AS ok")
+    if rows is None:
+        pytest.skip("Neo4j Aura unreachable from here")
+    assert rows == [{"ok": 1}]
+    # sync a tiny graph and read it back
+    eng = GraphEngine()
+    eng.add_entity("host", "n4-test-01", {"os": "test"})
+    eng.add_entity("user", "n4-tester", {"role": "test"})
+    eng.add_event("user:n4-tester", "host:n4-test-01", "auth", 1.0,
+                  {"suspicious": False})
+    res = n4.sync_graph(eng)
+    assert res is not None and res["nodes"] == 2 and res["edges"] == 1
+    back = n4.run_cypher(
+        "MATCH (n:GraphOpsEntity {id: 'host:n4-test-01'}) "
+        "RETURN n.etype AS etype")
+    assert back and back[0]["etype"] == "host"
+    assert n4.clear_graph() is True
+    assert n4.run_cypher(
+        "MATCH (n:GraphOpsEntity {id: 'host:n4-test-01'}) RETURN n") == []
+
+
+def test_neo4j_client_never_raises_without_config(monkeypatch):
+    from graphops.store import neo4j_client as n4
+    monkeypatch.setattr(n4, "_cfg", lambda: None)
+    assert n4.is_configured() is False
+    assert n4.run_cypher("RETURN 1") is None
+    assert n4.sync_graph(GraphEngine()) is None
+    assert n4.clear_graph() is False
+
+
+# ---------------------------------------------------------------------------
+# 12. New API endpoints
+# ---------------------------------------------------------------------------
+
+def test_api_hunt_privilege_escalation(client):
+    r = client.post("/hunt/privilege-escalation")
+    assert r.status_code == 200
+    findings = r.json()["findings"]
+    assert len(findings) == 1
+    assert findings[0]["severity"] == "critical"
+
+
+def test_api_hunt_data_staging(client):
+    r = client.post("/hunt/data-staging")
+    assert r.status_code == 200
+    findings = r.json()["findings"]
+    assert len(findings) == 1
+    assert findings[0]["severity"] == "critical"
+
+
+def test_api_redteam_replay(client):
+    r = client.post("/redteam/replay", json={"seed": 42})
+    assert r.status_code == 200
+    report = r.json()
+    assert report["campaign"] == "GRAPHOPS-DEMO-001"
+    assert report["coverage"] == "5/7"
+    assert len(report["stages"]) == 7

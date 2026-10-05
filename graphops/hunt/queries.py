@@ -307,6 +307,259 @@ def hunt_beaconing(engine: Any) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# hunt: privilege escalation (user -> admin via group nesting or token theft)
+# ---------------------------------------------------------------------------
+
+_PRIV_VALUES = {"admin", "administrator", "root", "system", "domain admin",
+                "enterprise admin", "da"}
+_PRIVESC_TECHNIQUES = {"T1134", "T1068", "T1055", "T1548", "T1134.001",
+                       "T1134.002", "T1078"}
+_MEMBERSHIP_ETYPES = {"member_of", "member", "in_group", "belongs_to", "nested_in"}
+_STAGING_TOOLS = {"7z.exe", "7za.exe", "rar.exe", "winrar.exe", "tar",
+                  "zip", "unzip"}
+
+
+def _is_priv_grant(info: Dict[str, Any]) -> bool:
+    """True when an edge payload signals privilege acquisition."""
+    priv = str(info.get("priv", "") or "").strip().lower()
+    if priv in _PRIV_VALUES:
+        return True
+    note = str(info.get("note", "") or "").lower()
+    if "privileg" in note and ("escalat" in note or "elevation" in note):
+        return True
+    tech = str(info.get("technique", "") or "").upper().strip()
+    if tech in _PRIVESC_TECHNIQUES:
+        return True
+    return False
+
+
+def _is_privileged_group(G: Any, node_id: Any) -> bool:
+    """True when a group-ish node looks administratively privileged."""
+    if _node_type(node_id) not in {"group", "role"}:
+        return False
+    attrs = _node_attrs(G, node_id)
+    if _is_truthy(attrs.get("admin")) or _is_truthy(attrs.get("privileged")):
+        return True
+    eid = str(node_id).split(":", 1)[-1].lower()
+    name = str(attrs.get("name", "") or "").lower()
+    return "admin" in eid or "admin" in name or "domain admins" in name
+
+
+def _origin_user(G: Any, node_id: Any, max_hops: int = 6) -> List[Any]:
+    """Path from an originating user to node_id; [] if none.
+
+    Prefers paths that traverse suspicious edges (the attack chain) over
+    incidental background logons: candidates are scored by (#suspicious
+    edges, -length) so the campaign path wins ties.
+    """
+    try:
+        import networkx as nx
+
+        def edge_suspicious(u, v):
+            return _is_truthy(_edge_info(G, u, v).get("suspicious"))
+
+        users = [n for n in G.nodes() if _node_type(n) == "user"]
+        scored = []
+        for u in users:
+            try:
+                for path in nx.all_shortest_paths(G, u, node_id):
+                    if len(path) - 1 > max_hops:
+                        continue
+                    susp = sum(
+                        1 for a, b in zip(path, path[1:]) if edge_suspicious(a, b)
+                    )
+                    scored.append((susp, -len(path), path))
+            except Exception:
+                continue
+        if not scored:
+            return []
+        scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+        return scored[0][2]
+    except Exception:
+        return []
+
+
+def hunt_privilege_escalation(engine: Any) -> List[Dict[str, Any]]:
+    """Find privilege-escalation signals: admin-grant edges and nested groups.
+
+    Flags (a) edges whose attrs grant admin-level privilege (priv=admin,
+    privilege-escalation notes, MITRE privesc techniques), and (b) group
+    nesting chains user -> group -> ... -> privileged group. Each finding
+    traces the path back to the originating user.
+    """
+    G = _get_graph(engine)
+    if G is None:
+        return []
+    findings: List[Dict[str, Any]] = []
+    try:
+        edges = list(G.edges())
+    except Exception:
+        return []
+
+    # (a) direct privilege-grant edges
+    for src, dst in edges:
+        info = _edge_info(G, src, dst)
+        if not _is_priv_grant(info):
+            continue
+        ts = info.get("ts") or info.get("timestamp")
+        path = _origin_user(G, src)
+        origin = path[0] if path else src
+        tech = str(info.get("technique", "") or "").upper().strip()
+        priv = str(info.get("priv", "") or "").strip()
+        evidence = [
+            f"{src} -> {dst} at {_fmt_ts(ts)}: privilege grant "
+            f"(priv={priv or 'n/a'}, technique={tech or 'n/a'})"
+        ]
+        if path and len(path) > 1:
+            evidence.append(
+                f"escalation path: {' -> '.join(str(p) for p in path)} -> {dst}"
+            )
+        severity = "critical" if (tech or "lsass" in str(dst).lower()) else "high"
+        findings.append(
+            {
+                "title": f"Privilege escalation: {origin} reached admin via {dst}",
+                "severity": severity,
+                "evidence": evidence,
+                "nodes": list(dict.fromkeys([origin, src, dst])),
+            }
+        )
+
+    # (b) group nesting: user -> group+ -> privileged group
+    try:
+        import networkx as nx
+        membership = [
+            (u, v) for u, v in edges
+            if _edge_etype(_edge_info(G, u, v)) in _MEMBERSHIP_ETYPES
+        ]
+        if membership:
+            sub = nx.DiGraph()
+            sub.add_edges_from(membership)
+            for node in list(sub.nodes()):
+                if not _is_privileged_group(G, node):
+                    continue
+                for user in [n for n in sub.nodes() if _node_type(n) == "user"]:
+                    try:
+                        path = nx.shortest_path(sub, user, node)
+                    except Exception:
+                        continue
+                    if len(path) < 3:  # need real nesting, not direct membership
+                        continue
+                    findings.append(
+                        {
+                            "title": f"Privilege escalation: {user} nested into "
+                                     f"privileged group {node}",
+                            "severity": "high",
+                            "evidence": [
+                                f"group nesting path: "
+                                f"{' -> '.join(str(p) for p in path)}"
+                            ],
+                            "nodes": path,
+                        }
+                    )
+    except Exception:
+        pass
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# hunt: data staging (archive/collect before exfiltration)
+# ---------------------------------------------------------------------------
+
+def _is_staging_edge(G: Any, src: Any, dst: Any, info: Dict[str, Any]) -> bool:
+    if _node_type(src) != "host" or _node_type(dst) != "process":
+        return False
+    eid = str(dst).split(":", 1)[-1].lower()
+    if eid in _STAGING_TOOLS:
+        return True
+    note = str(info.get("note", "") or "").lower()
+    if "stag" in note:
+        return True
+    cmdline = str(info.get("cmdline", "") or "").lower()
+    if any(t in cmdline for t in ("7z", ".rar", ".zip", "compress", "archive")):
+        return True
+    return False
+
+
+def _is_exfil_edge(G: Any, src: Any, dst: Any, info: Dict[str, Any]) -> bool:
+    if _node_type(src) != "host" or _node_type(dst) != "ip":
+        return False
+    if not _is_external_ip(str(dst).split(":", 1)[-1]):
+        return False
+    note = str(info.get("note", "") or "").lower()
+    if "exfil" in note:
+        return True
+    try:
+        if float(info.get("bytes") or 0) >= 100_000_000:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return _is_truthy(info.get("suspicious")) and _edge_etype(info) == "network"
+
+
+def hunt_data_staging(engine: Any) -> List[Dict[str, Any]]:
+    """Find data-staging activity and correlate it with later exfiltration.
+
+    Flags host -> archiving-process edges (7z/rar/zip, staging notes,
+    archive cmdlines). When the same host later talks to an external IP
+    with exfiltration signals, the finding is critical and links both.
+    """
+    G = _get_graph(engine)
+    if G is None:
+        return []
+    findings: List[Dict[str, Any]] = []
+    try:
+        edges = list(G.edges())
+    except Exception:
+        return []
+    for src, dst in edges:
+        info = _edge_info(G, src, dst)
+        if not _is_staging_edge(G, src, dst, info):
+            continue
+        ts = info.get("ts") or info.get("timestamp")
+        try:
+            ts_f = float(ts) if ts is not None else None
+        except (TypeError, ValueError):
+            ts_f = None
+        # correlate: same host -> external ip with exfil signals afterwards
+        exfil_evidence: List[str] = []
+        exfil_dst = None
+        for s2, d2 in edges:
+            if s2 != src:
+                continue
+            info2 = _edge_info(G, s2, d2)
+            if not _is_exfil_edge(G, s2, d2, info2):
+                continue
+            ts2 = info2.get("ts") or info2.get("timestamp")
+            try:
+                ts2_f = float(ts2) if ts2 is not None else None
+            except (TypeError, ValueError):
+                ts2_f = None
+            if ts_f is not None and ts2_f is not None and ts2_f < ts_f:
+                continue  # exfil before staging: not this pattern
+            exfil_dst = d2
+            exfil_evidence.append(
+                f"{s2} -> {d2} at {_fmt_ts(ts2)}: exfiltration signal after staging"
+            )
+            break
+        evidence = [
+            f"{src} -> {dst} at {_fmt_ts(ts)}: data staging "
+            f"(cmdline={str(info.get('cmdline', 'n/a'))[:80]})"
+        ]
+        evidence.extend(exfil_evidence)
+        severity = "critical" if exfil_dst else "high"
+        nodes = [src, dst] + ([exfil_dst] if exfil_dst else [])
+        findings.append(
+            {
+                "title": f"Data staging: {src} archived data via {dst}"
+                         + (f" before exfiltration to {exfil_dst}" if exfil_dst else ""),
+                "severity": severity,
+                "evidence": evidence,
+                "nodes": nodes,
+            }
+        )
+    return findings
+
+# ---------------------------------------------------------------------------
 # hunt: impossible travel
 # ---------------------------------------------------------------------------
 
