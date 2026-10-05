@@ -1,15 +1,26 @@
 /* GraphOps SOC dashboard — zero hardcoded data.
- * Everything renders from the API at http://localhost:8000:
+ * Everything renders from the API:
  *   GET  /health        -> node/edge counts
  *   GET  /graph         -> {nodes, edges}
  *   POST /hunt          -> {findings}
  *   POST /blast-radius  -> {blast_radius, actions}   (body: {node_id})
+ * API base resolution (first match wins):
+ *   1. ?api=https://... query param
+ *   2. window.GRAPHOPS_API_BASE
+ *   3. same-origin /api            (Vercel / any single-host deploy)
+ *   4. http://localhost:8000      (local dev: uvicorn graphops.api.server:app)
  * If the API is down, an explicit offline state is shown — nothing is faked.
  */
 'use strict';
 
 /* ================= API contract ================= */
-const API_BASE = 'http://localhost:8000';
+const API_BASE = (() => {
+  const q = new URLSearchParams(location.search).get('api');
+  if (q) return q.replace(/\/+$/, '');
+  if (window.GRAPHOPS_API_BASE) return String(window.GRAPHOPS_API_BASE).replace(/\/+$/, '');
+  if (location.protocol.startsWith('http')) return '/api';
+  return 'http://localhost:8000';
+})();
 const EP_HEALTH = API_BASE + '/health';
 const EP_HUNT = API_BASE + '/hunt';
 const EP_BLAST = API_BASE + '/blast-radius';
@@ -86,7 +97,8 @@ function nodeIdOf(n) { return n && (n.id ?? n.node_id ?? n.name); }
 function nodeTypeOf(n) { return String(n && (n.etype ?? n.type ?? 'unknown')).toLowerCase(); }
 function nodeLabelOf(n) { return (n && (n.label ?? n.name ?? n.id ?? n.node_id)) ?? ''; }
 function edgeEnd(e, key) {
-  const v = e && (e[key] ?? (key === 'source' ? e.from : e.to));
+  // API shapes: {src,dst} (current) or {source,target} / {from,to} (legacy)
+  const v = e && (e[key] ?? (key === 'source' ? (e.src ?? e.from) : (e.dst ?? e.to)));
   return (v && typeof v === 'object') ? nodeIdOf(v) : v;
 }
 
@@ -95,16 +107,20 @@ window.addEventListener('DOMContentLoaded', init);
 
 async function init() {
   el.footStamp.textContent = 'loaded ' + new Date().toLocaleString();
+  const footApi = document.getElementById('footApi');
+  if (footApi) footApi.textContent = API_BASE;
   sizeCanvas();
   window.addEventListener('resize', () => { sizeCanvas(); draw(); });
   wireCanvas();
   el.btnRunHunt.addEventListener('click', runHunt);
   el.btnDemo.addEventListener('click', runDemoScenario);
+  exposeBridge();
 
   const up = await checkHealth();
-  if (!up) { setOffline(); return; }
+  if (!up) { setOffline(); if (window.UI) UI.bootDone(); return; }
   setOnline();
   await loadGraph();
+  if (window.UI) UI.bootDone();
 }
 
 async function checkHealth() {
@@ -172,6 +188,12 @@ async function loadGraph() {
     // authoritative counts from /graph itself
     el.healthLine.innerHTML =
       `nodes <b>${state.nodes.length}</b> · edges <b>${state.edges.length}</b> · <span style="color:var(--green)">online</span>`;
+    if (window.UI) {
+      UI.countUp(document.getElementById('statNodes'), state.nodes.length);
+      UI.countUp(document.getElementById('statEdges'), state.edges.length);
+    }
+    // keep the 3D view in sync if it is initialized
+    if (window.Graph3D) pushGraphTo3D();
 
     if (state.nodes.length === 0) {
       el.canvasStatus.textContent = 'graph is empty';
@@ -384,6 +406,10 @@ async function runHunt() {
     const raw = data.findings ?? data.results ?? [];
     state.findings = raw.map(normalizeFinding).filter((f) => f.title);
     renderFindings();
+    if (window.UI) {
+      UI.animateFindings();
+      UI.countUp(document.getElementById('statFindings'), state.findings.length, { dur: 0.7 });
+    }
     el.huntStatus.textContent =
       state.findings.length === 0
         ? 'Hunt complete — no findings returned.'
@@ -442,6 +468,7 @@ async function runDemoScenario() {
   el.canvasStatus.textContent = 'running demo scenario… (POST /hunt)';
   await runHunt();
   state.attackPath = new Set(state.findings.flatMap((f) => f.nodes));
+  if (window.Graph3D) window.Graph3D.setAttackPath(state.attackPath);
   if (state.attackPath.size > 0) {
     el.canvasStatus.textContent =
       `attack path highlighted — ${state.attackPath.size} node${state.attackPath.size > 1 ? 's' : ''} from ${state.findings.length} finding${state.findings.length > 1 ? 's' : ''}`;
@@ -477,7 +504,12 @@ async function runBlastRadius(nodeId) {
       body: JSON.stringify({ node_id: nodeId }),
     });
     const rawBr = data.blast_radius ?? data.blastRadius ?? data.nodes ?? [];
-    const list = Array.isArray(rawBr) ? rawBr : (rawBr.nodes ?? []);
+    // API returns a dict {nodeId: {distance, risk_score}}; also accept list forms
+    const list = Array.isArray(rawBr)
+      ? rawBr
+      : (rawBr && typeof rawBr === 'object'
+          ? Object.entries(rawBr).map(([id, v]) => ({ id, ...((v && typeof v === 'object') ? v : {}) }))
+          : []);
     const rows = list
       .map((r) => ({
         id: String(r.id ?? r.node_id ?? nodeIdOf(r) ?? ''),
@@ -489,7 +521,7 @@ async function runBlastRadius(nodeId) {
     const rawActions = data.actions ?? data.recommendations ?? [];
     const actions = (Array.isArray(rawActions) ? rawActions : []).map((a) => ({
       text: String(a.action ?? a.title ?? a.name ?? ''),
-      desc: String(a.description ?? a.detail ?? a.why ?? ''),
+      desc: String(a.description ?? a.detail ?? a.why ?? a.rationale ?? ''),
       priority: String(a.priority ?? a.severity ?? 'P3'),
     })).filter((a) => a.text);
 
@@ -527,4 +559,74 @@ function renderBlast() {
   el.blastEmpty.hidden = true;
   el.blastResults.hidden = false;
   draw();
+  if (window.UI) {
+    UI.blastPulse();
+    UI.countUp(document.getElementById('statBlast'), b.rows.length, { dur: 0.7 });
+  }
+  if (window.Graph3D) {
+    const riskById = b.rows.map((r) => [r.id, r.risk]);
+    window.Graph3D.setBlast(state.blastSet, riskById);
+  }
+}
+
+/* ================= bridge for ui.js / graph3d.js ================= */
+function pushGraphTo3D() {
+  if (!window.Graph3D || state.nodes.length === 0) return;
+  window.Graph3D.setData(
+    state.nodes.map((n) => ({ id: n.id, etype: n.etype, label: n.label, degree: n.degree })),
+    state.edges.map((e) => ({ a: e.source.id, b: e.target.id }))
+  );
+  window.Graph3D.onNodeClick = (id) => runBlastRadius(id);
+  window.Graph3D._wired = true;
+}
+
+function clearHighlights() {
+  state.attackPath = new Set();
+  state.blastSet = new Set();
+  state.blast = null;
+  el.blastResults.hidden = true;
+  el.blastEmpty.hidden = false;
+  el.blastSource.textContent = '';
+  if (window.Graph3D) {
+    window.Graph3D.setAttackPath(new Set());
+    window.Graph3D.setBlast(new Set(), []);
+  }
+  const sb = document.getElementById('statBlast');
+  if (sb && window.UI) UI.countUp(sb, 0, { dur: 0.5 });
+  draw();
+}
+
+function focusFinding(i) {
+  const f = state.findings[i];
+  if (!f) return;
+  state.attackPath = new Set(f.nodes);
+  if (window.Graph3D) window.Graph3D.setAttackPath(state.attackPath);
+  pulseLoop();
+  draw();
+  const cards = el.findingsList.querySelectorAll('.finding');
+  if (cards[i] && cards[i].scrollIntoView) cards[i].scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function exposeBridge() {
+  window.GraphOps = {
+    getGraphData: () => ({
+      nodes: state.nodes.map((n) => ({ id: n.id, etype: n.etype, label: n.label, degree: n.degree })),
+      edges: state.edges.map((e) => ({ a: e.source.id, b: e.target.id })),
+    }),
+    getBlast: () => (state.blast
+      ? { set: state.blastSet, risk: state.blast.rows.map((r) => [r.id, r.risk]) }
+      : null),
+    getAttackPath: () => state.attackPath,
+    getFindings: () => state.findings,
+    runHunt,
+    runDemo: runDemoScenario,
+    runBlast: runBlastRadius,
+    clearHighlights,
+    focusFinding,
+    redraw2d: () => draw(),
+  };
+  if (window.Graph3D) {
+    window.Graph3D.onNodeClick = (id) => runBlastRadius(id);
+    window.Graph3D._wired = true;
+  }
 }
