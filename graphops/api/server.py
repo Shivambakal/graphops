@@ -193,6 +193,37 @@ N_EDGES = len(_normalize_edges(engine))
 app = FastAPI(title="GraphOps API", version="0.1.0")
 
 
+# ---------------------------------------------------------------------------
+# /api prefix tolerance. On Vercel the function receives the original path
+# (/api/hunt); locally (uvicorn) there is no prefix. Strip it when present.
+# ---------------------------------------------------------------------------
+try:
+    from starlette.middleware.base import BaseHTTPMiddleware
+
+    class _StripApiPrefix(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            p = request.scope.get("path", "")
+            if p in ("/api", "/api/"):
+                request.scope["path"] = "/"
+            elif p.startswith("/api/"):
+                request.scope["path"] = p[4:]
+            return await call_next(request)
+
+    app.add_middleware(_StripApiPrefix)
+except Exception:
+    traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
+# Supabase persistence (optional). If SUPABASE_URL / SUPABASE_SECRET_KEY are
+# not set, the app runs fully without persistence — nothing here raises.
+# ---------------------------------------------------------------------------
+try:
+    from graphops.store import supabase_client as _store
+except Exception:
+    _store = None
+
+
 class BlastRadiusRequest(BaseModel):
     node_id: str
 
@@ -227,6 +258,11 @@ def hunt():
                 findings.extend(res if isinstance(res, list) else [res])
         except Exception:
             traceback.print_exc()  # a failing query contributes nothing, never a 500
+    if _store is not None:
+        try:
+            _store.record_hunt_run(N_NODES, N_EDGES, findings, ENGINE_SOURCE)
+        except Exception:
+            traceback.print_exc()
     return {"findings": findings}
 
 
@@ -255,3 +291,70 @@ def graph_summary():
         "edges": edges[:MAX_GRAPH_EDGES],
         "truncated": truncated,
     }
+
+
+# ---------------------------------------------------------------------------
+# Analyst decision gate — the human-in-the-loop audit trail.
+# Every containment action an analyst approves/rejects is recorded (Supabase
+# when configured). Nothing auto-executes, ever.
+# NOTE: these routes must be registered BEFORE the static "/" mount below,
+# otherwise the mount shadows them.
+# ---------------------------------------------------------------------------
+class DecisionRequest(BaseModel):
+    node_id: str
+    action: str
+    target: str = ""
+    decision: str  # approved | rejected
+    rationale: str = ""
+
+
+@app.post("/decisions")
+def record_decision(req: DecisionRequest):
+    if req.decision not in ("approved", "rejected"):
+        raise HTTPException(status_code=400, detail="decision must be 'approved' or 'rejected'")
+    stored_id = None
+    if _store is not None:
+        try:
+            stored_id = _store.record_decision(
+                req.node_id, req.action, req.target, req.decision, req.rationale
+            )
+        except Exception:
+            traceback.print_exc()
+    return {"ok": True, "stored": stored_id is not None, "id": stored_id}
+
+
+@app.get("/decisions")
+def list_decisions(limit: int = 50):
+    items = []
+    if _store is not None:
+        try:
+            items = _store.list_decisions(limit=min(max(limit, 1), 200))
+        except Exception:
+            traceback.print_exc()
+    return {"decisions": items, "persisted": _store is not None and _store.is_configured()}
+
+
+@app.get("/hunt-runs")
+def list_hunt_runs(limit: int = 20):
+    items = []
+    if _store is not None:
+        try:
+            items = _store.list_hunt_runs(limit=min(max(limit, 1), 100))
+        except Exception:
+            traceback.print_exc()
+    return {"hunt_runs": items, "persisted": _store is not None and _store.is_configured()}
+
+
+# ---------------------------------------------------------------------------
+# Serve the dashboard UI from the same process (Docker / Render / Fly /
+# Hugging Face single-container deploys). API routes registered above take
+# precedence; this mount is the LAST route and only a fallback for "/".
+# ---------------------------------------------------------------------------
+try:
+    from fastapi.staticfiles import StaticFiles
+
+    _DASHBOARD_DIR = _BUILD_DIR / "dashboard"
+    if _DASHBOARD_DIR.is_dir():
+        app.mount("/", StaticFiles(directory=str(_DASHBOARD_DIR), html=True), name="dashboard")
+except Exception:
+    traceback.print_exc()
