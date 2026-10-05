@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GraphOps — SOC Threat Hunting</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="scanlines" aria-hidden="true"></div>
+
+<!-- ============ HEADER ============ -->
+<header class="topbar">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 40 40" width="34" height="34" aria-hidden="true">
+      <circle cx="20" cy="20" r="17" fill="none" stroke="#22d3ee" stroke-width="1.5" opacity="0.5"/>
+      <circle cx="12" cy="15" r="4" fill="#22d3ee"/>
+      <circle cx="28" cy="14" r="4" fill="#a78bfa"/>
+      <circle cx="20" cy="28" r="4" fill="#f87171"/>
+      <line x1="12" y1="15" x2="28" y2="14" stroke="#475569" stroke-width="1.5"/>
+      <line x1="12" y1="15" x2="20" y2="28" stroke="#475569" stroke-width="1.5"/>
+      <line x1="28" y1="14" x2="20" y2="28" stroke="#475569" stroke-width="1.5"/>
+    </svg>
+    <div>
+      <h1>GraphOps <span class="dash">—</span> <span class="sub">SOC Threat Hunting</span></h1>
+      <p class="tagline">graph analytics for proactive threat hunting &amp; blast-radius containment</p>
+    </div>
+  </div>
+  <div class="health">
+    <span id="apiStatus" class="status-dot unknown" title="API status"></span>
+    <span id="healthLine" class="health-line">connecting…</span>
+    <span class="synth-badge">SYNTHETIC DATA</span>
+  </div>
+</header>
+
+<!-- ============ OFFLINE BANNER ============ -->
+<div id="offlineBanner" class="offline-banner" hidden>
+  <strong>API offline</strong>
+  <span>— start it with:</span>
+  <code>uvicorn graphops.api.server:app</code>
+</div>
+
+<!-- ============ MAIN GRID ============ -->
+<main class="grid">
+
+  <!-- LEFT: hunt findings -->
+  <aside class="panel left" aria-label="Hunt findings">
+    <div class="panel-head">
+      <h2>Hunt findings</h2>
+      <button id="btnRunHunt" class="btn primary">▶ Run hunt</button>
+    </div>
+    <p id="huntStatus" class="muted small">No hunt run yet. Findings come live from <code>POST /hunt</code>.</p>
+    <div id="findingsList" class="findings"></div>
+  </aside>
+
+  <!-- CENTER: graph canvas -->
+  <section class="panel center" aria-label="Threat graph">
+    <div class="panel-head">
+      <h2>Threat graph</h2>
+      <div class="canvas-tools">
+        <span id="canvasStatus" class="muted small">layout idle</span>
+        <button id="btnDemo" class="btn accent">⚡ Run demo attack scenario</button>
+      </div>
+    </div>
+    <div id="canvasWrap" class="canvas-wrap">
+      <canvas id="graphCanvas"></canvas>
+      <div id="tooltip" class="tooltip" hidden></div>
+      <div id="legend" class="legend">
+        <span class="leg"><i style="--c:#38bdf8"></i>host</span>
+        <span class="leg"><i style="--c:#a78bfa"></i>user</span>
+        <span class="leg"><i style="--c:#fbbf24"></i>ip</span>
+        <span class="leg"><i style="--c:#34d399"></i>process</span>
+        <span class="leg"><i style="--c:#f87171"></i>alert</span>
+      </div>
+    </div>
+    <p class="hint muted small">drag nodes to rearrange · hover for detail · click a node to compute its blast radius</p>
+  </section>
+
+  <!-- RIGHT: blast radius -->
+  <aside class="panel right" aria-label="Blast radius">
+    <div class="panel-head">
+      <h2>Blast radius</h2>
+      <span id="blastSource" class="muted small"></span>
+    </div>
+    <div class="human-gate">⛔ RECOMMENDED ONLY — human must approve; nothing auto-executes.</div>
+    <div id="blastEmpty" class="empty">Click any node (in findings or on the graph) to compute its blast radius via <code>POST /blast-radius</code>.</div>
+    <div id="blastResults" hidden>
+      <table class="blast-table">
+        <thead><tr><th>node</th><th>distance</th><th>risk</th></tr></thead>
+        <tbody id="blastRows"></tbody>
+      </table>
+      <h3 class="actions-head">Containment actions</h3>
+      <div id="actionsList" class="actions"></div>
+    </div>
+  </aside>
+</main>
+
+<footer class="foot muted small">
+  <span>API: <code>http://localhost:8000</code> · <code>GET /health</code> · <code>POST /hunt</code> · <code>POST /blast-radius</code> · <code>GET /graph</code></span>
+  <span id="footStamp"></span>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
