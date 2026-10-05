@@ -1,0 +1,29 @@
+name: GraphOps CI
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Run tests
+        run: python -m pytest tests/ -q
+      - name: API smoke test
+        run: |
+          python - <<'EOF'
+          from fastapi.testclient import TestClient
+          import api.index as v
+          c = TestClient(v.app)
+          assert c.get("/").status_code == 200
+          assert c.get("/api/health").json()["status"] == "ok"
+          assert c.post("/api/hunt").status_code == 200
+          print("smoke OK")
+          EOF

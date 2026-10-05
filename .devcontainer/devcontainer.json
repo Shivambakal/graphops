@@ -1,0 +1,1 @@
+{"forwardPorts":[8000],"image":"mcr.microsoft.com/devcontainers/python:3.11","name":"GraphOps","portsAttributes":{"8000":{"label":"GraphOps API + dashboard","onAutoForward":"openPreview"}},"postCreateCommand":"pip install -r requirements.txt"}
