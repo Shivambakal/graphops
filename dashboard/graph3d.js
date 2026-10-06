@@ -3,7 +3,7 @@
  * Exposes window.Graph3D. Lazy init: call init(container) then setData().
  */
 import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { OrbitControls } from 'three/addons/OrbitControls.js';
 
 const ETYPE_HEX = {
   host: 0x38bdf8,
@@ -24,6 +24,7 @@ const G = {
   meshById: new Map(),
   nodes: [], edges: [],
   blastSet: new Set(), blastRisk: new Map(), attackSet: new Set(),
+  exfilSet: new Set(),
   hovered: null,
   layout: null,        // {iter, total} while settling
   shockwaves: [],
@@ -191,7 +192,7 @@ function setData(nodes, edges) {
     blending: THREE.AdditiveBlending, depthWrite: false,
   }));
   G.edgeLines.userData.edgePairs = edges
-    .map((e) => [G.meshById.get(e.a), G.meshById.get(e.b)])
+    .map((e) => [G.meshById.get(e.a), G.meshById.get(e.b), String(e.etype || '')])
     .filter(([a, b]) => a && b);
   const meshIndex = new Map(G.meshes.map((m, i) => [m, i]));
   G.edgeLines.userData.edgeIdx = G.edgeLines.userData.edgePairs
@@ -209,12 +210,17 @@ function refreshEdgeGeometry() {
   const p = G.edgeLines.geometry.attributes.position.array;
   const c = G.edgeLines.geometry.attributes.color.array;
   const dim = new THREE.Color(0x2a3a5c);
+  const lateral = new THREE.Color(0x7a4b2a); // lateral-movement etypes: smb/winrm/rdp/ssh/lateral
+  const hot = new THREE.Color(0xf87171);     // attack-path edges
+  const LATERAL_RE = /smb|winrm|rdp|ssh|wmi|rpc|lateral|network/i;
   let k = 0;
-  for (const [a, b] of pairs) {
+  for (const [a, b, etype] of pairs) {
     p[k * 3] = a.position.x; p[k * 3 + 1] = a.position.y; p[k * 3 + 2] = a.position.z;
     p[k * 3 + 3] = b.position.x; p[k * 3 + 4] = b.position.y; p[k * 3 + 5] = b.position.z;
-    c[k * 3] = dim.r; c[k * 3 + 1] = dim.g; c[k * 3 + 2] = dim.b;
-    c[k * 3 + 3] = dim.r; c[k * 3 + 4] = dim.g; c[k * 3 + 5] = dim.b;
+    const col = (G.attackSet.has(a.userData.id) && G.attackSet.has(b.userData.id)) ? hot
+      : (LATERAL_RE.test(etype) ? lateral : dim);
+    c[k * 3] = col.r; c[k * 3 + 1] = col.g; c[k * 3 + 2] = col.b;
+    c[k * 3 + 3] = col.r; c[k * 3 + 4] = col.g; c[k * 3 + 5] = col.b;
     k++;
   }
   G.edgeLines.geometry.setDrawRange(0, pairs.length * 2);
@@ -284,13 +290,21 @@ function applyBlastColors() {
   for (const mesh of G.meshes) {
     const u = mesh.userData;
     const risk = G.blastRisk.get(u.id);
-    if (risk !== undefined && risk !== null && Number.isFinite(Number(risk))) {
+    if (G.exfilSet.has(u.id)) {
+      // exfil-risk overlay wins: suspected C2/exfil endpoint, hot amber
+      mesh.material.color.copy(EXFIL_HEX);
+      mesh.material.emissive.copy(EXFIL_HEX).multiplyScalar(0.7);
+    } else if (risk !== undefined && risk !== null && Number.isFinite(Number(risk))) {
       const rn = Math.max(0, Math.min(1, Number(risk) <= 1 ? Number(risk) : Number(risk) / 100));
       mesh.material.color.copy(u.baseColor).lerp(RISK_HEX, 0.25 + rn * 0.65);
       mesh.material.emissive.copy(mesh.material.color).multiplyScalar(0.55);
     } else if (G.blastSet.has(u.id)) {
       mesh.material.color.set(0x22d3ee);
       mesh.material.emissive.set(0x22d3ee).multiplyScalar(0.6);
+    } else if (u.etype === 'alert') {
+      // alert nodes: always a touch hotter so they stand out pre-blast
+      mesh.material.color.copy(u.baseColor);
+      mesh.material.emissive.copy(u.baseColor).multiplyScalar(0.55);
     } else {
       mesh.material.color.copy(u.baseColor);
       mesh.material.emissive.copy(u.baseColor).multiplyScalar(0.25);
@@ -321,6 +335,53 @@ function setBlast(idSet, riskById) {
 
 function setAttackPath(idSet) {
   G.attackSet = new Set(idSet || []);
+  if (G.inited && G.edgeLines) refreshEdgeGeometry(); // hot edges on the attack path
+}
+
+/* ---------- exfil-risk overlay: external IPs near the compromised source ---------- */
+const EXFIL_HEX = new THREE.Color(0xff7847);
+function setExfil(idSet) {
+  G.exfilSet = new Set(idSet || []);
+  if (!G.inited) return;
+  applyBlastColors();
+}
+
+/* ---------- camera fly-to on selection ---------- */
+function flyTo(id) {
+  if (!G.inited) return;
+  const mesh = G.meshById.get(id);
+  if (!mesh) return;
+  const target = mesh.position.clone();
+  const dir = G.camera.position.clone().sub(target);
+  if (dir.length() < 1e-3) dir.set(0.4, 0.35, 1);
+  dir.normalize().multiplyScalar(85); // cinematic close-up distance
+  const camTo = target.clone().add(dir);
+  const g = window.gsap;
+  if (G.controls) G.controls.autoRotate = false;
+  if (g) {
+    g.to(G.camera.position, {
+      x: camTo.x, y: camTo.y, z: camTo.z,
+      duration: 1.25, ease: 'power3.inOut', overwrite: true,
+    });
+    g.to(G.controls.target, {
+      x: target.x, y: target.y, z: target.z,
+      duration: 1.25, ease: 'power3.inOut', overwrite: true,
+      onUpdate: () => G.controls.update(),
+    });
+  } else {
+    G.camera.position.copy(camTo);
+    G.controls.target.copy(target);
+    G.controls.update();
+  }
+  // attention ping on the selected node
+  const sm = new THREE.Mesh(
+    new THREE.SphereGeometry(1, 18, 12),
+    new THREE.MeshBasicMaterial({ color: 0xf87171, transparent: true, opacity: 0.6, wireframe: true })
+  );
+  sm.position.copy(target);
+  sm.scale.setScalar(mesh.userData.baseSize);
+  G.scene.add(sm);
+  G.shockwaves.push({ mesh: sm, t: 0 });
 }
 
 /* ---------- pointer ---------- */
@@ -397,6 +458,8 @@ function tick() {
     if (G.attackSet.has(id)) {
       s *= 1 + 0.28 * Math.sin(t * 6);
       mesh.material.emissive.setHex(0xf87171).multiplyScalar(0.55 + 0.3 * Math.sin(t * 6));
+    } else if (G.exfilSet.has(id)) {
+      s *= 1 + 0.22 * Math.sin(t * 5 + 0.6); // exfil-risk pulse (suspected C2)
     } else if (G.blastSet.has(id)) {
       s *= 1 + 0.16 * Math.sin(t * 4 + 1);
     } else if (G.hovered === mesh) {
@@ -433,4 +496,4 @@ function setVisible(v) {
   }
 }
 
-window.Graph3D = { init, setData, setBlast, setAttackPath, setVisible, resize };
+window.Graph3D = { init, setData, setBlast, setExfil, setAttackPath, setVisible, resize, flyTo };

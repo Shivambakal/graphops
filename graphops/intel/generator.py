@@ -27,6 +27,11 @@ try:  # pragma: no cover - real sibling module may not exist yet at test time
 except ImportError:  # pragma: no cover
     GraphEngine = None  # type: ignore[assignment]
 
+try:
+    from graphops.graph.identity import seed_identity_layer
+except ImportError:  # pragma: no cover
+    seed_identity_layer = None  # type: ignore[assignment]
+
 # Fixed base epoch for all synthetic timestamps (deterministic).
 BASE_EPOCH = 1728000000.0  # 2024-10-04 00:00:00 UTC
 SEVEN_DAYS = 7 * 86400.0
@@ -192,6 +197,17 @@ def _embed_attack(engine):
                      edge_attrs(proto="https", port=443, bytes=873_412_352,
                                 note="exfiltration"))
 
+    # Stage 7 (identity): impossible travel — the phished user authenticates
+    # from two distinct geos 500 s apart (TEST-NET IPs, synthetic).
+    engine.add_entity("ip", "203.0.113.60",
+                      {"geo": "US", "test_net": True, "synthetic": True})
+    engine.add_entity("ip", "203.0.113.61",
+                      {"geo": "IN", "test_net": True, "synthetic": True})
+    engine.add_event(PHISH_USER, "ip:203.0.113.60", "auth", T0 + 3600,
+                     edge_attrs(note="sso-login"))
+    engine.add_event(PHISH_USER, "ip:203.0.113.61", "auth", T0 + 4100,
+                     edge_attrs(note="sso-login"))
+
     # Alert entities pinned to each compromised host.
     alerts = [
         ("alt-phish-01", FOOTHOLD_HOST, "high", "phishing-click"),
@@ -228,6 +244,10 @@ def generate(seed: int = 42):
     _build_entities(engine, rng)
     _background_events(engine, rng)
     _embed_attack(engine)
+    if seed_identity_layer is not None:
+        seed_identity_layer(engine, rng,
+                            [f"user:{u}" for u in _USER_NAMES],
+                            anomaly_user=PHISH_USER)
 
     # Mark the whole engine as synthetic (duck-typed for the contract).
     try:

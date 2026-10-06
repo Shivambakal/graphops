@@ -83,7 +83,12 @@
   <aside class="panel left" aria-label="Hunt findings">
     <div class="panel-head">
       <h2>Hunt findings</h2>
-      <button id="btnRunHunt" class="btn primary">▶ Run hunt</button>
+      <div class="hunt-tools">
+        <label class="autorf" title="Auto-refresh hunt every 45s">
+          <input type="checkbox" id="autoRefresh" checked> <span>auto</span>
+        </label>
+        <button id="btnRunHunt" class="btn primary">▶ Run hunt</button>
+      </div>
     </div>
     <p id="huntStatus" class="muted small">No hunt run yet. Findings come live from <code>POST /hunt</code>.</p>
     <div id="findingsList" class="findings"></div>
@@ -115,7 +120,7 @@
         <span class="leg"><i style="--c:#f87171"></i>alert</span>
       </div>
     </div>
-    <p class="hint muted small">2D: drag nodes · hover for detail · click a node for blast radius &nbsp;|&nbsp; 3D: drag to orbit · scroll to zoom · click a node for blast radius</p>
+    <p class="hint muted small">2D: drag nodes · hover for detail · click a node for blast radius · title click → evidence chain &nbsp;|&nbsp; 3D: drag to orbit · scroll to zoom · click a node for blast radius &nbsp;|&nbsp; keys: <code>H</code> hunt · <code>D</code> demo · <code>E</code> evidence · <code>C</code> clear · <code>⌘K</code> commands</p>
   </section>
 
   <!-- RIGHT: blast radius -->
@@ -125,7 +130,7 @@
       <span id="blastSource" class="muted small"></span>
     </div>
     <div class="human-gate">⛔ RECOMMENDED ONLY — human must approve; nothing auto-executes.</div>
-    <div id="blastEmpty" class="empty">Click any node (in findings or on the graph) to compute its blast radius via <code>POST /blast-radius</code>.</div>
+    <div id="blastEmpty" class="empty">Click any node (in findings or on the graph) to compute its blast radius via <code>POST /blast-radius</code>. External IP nodes in radius get an <b class="exfil-tag">EXFIL RISK</b> badge (suspected C2/exfil endpoint).</div>
     <div id="blastResults" hidden>
       <table class="blast-table">
         <thead><tr><th>node</th><th>distance</th><th>risk</th></tr></thead>
@@ -141,6 +146,21 @@
   <span>API: <code id="footApi">http://localhost:8000</code> · <code>GET /health</code> · <code>POST /hunt</code> · <code>POST /blast-radius</code> · <code>GET /graph</code></span>
   <span id="footStamp"></span>
 </footer>
+
+<!-- ============ TOASTS ============ -->
+<div id="toasts" class="toasts" aria-live="polite"></div>
+
+<!-- ============ EVIDENCE-CHAIN DRAWER ============ -->
+<aside id="drawer" class="drawer" hidden aria-label="Evidence chain">
+  <div class="drawer-head">
+    <div>
+      <h2>Evidence chain</h2>
+      <p id="drawerSub" class="muted small"></p>
+    </div>
+    <button id="btnDrawerClose" class="btn ghost">✕</button>
+  </div>
+  <div id="drawerBody" class="drawer-body"></div>
+</aside>
 
 <!-- ============ COMMAND PALETTE ============ -->
 <div id="palette" class="palette" hidden>

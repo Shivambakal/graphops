@@ -241,11 +241,13 @@ def hunt():
             hunt_lateral_movement,
             hunt_beaconing,
             hunt_impossible_travel,
+            hunt_oauth_scope_creep,
         )
         queries = [
             ("lateral_movement", hunt_lateral_movement),
             ("beaconing", hunt_beaconing),
             ("impossible_travel", hunt_impossible_travel),
+            ("oauth_scope_creep", hunt_oauth_scope_creep),
         ]
     except Exception:
         traceback.print_exc()
@@ -258,6 +260,12 @@ def hunt():
                 findings.extend(res if isinstance(res, list) else [res])
         except Exception:
             traceback.print_exc()  # a failing query contributes nothing, never a 500
+    # Every finding ships its evidence chain (signals + subgraph + recommendation).
+    try:
+        from graphops.hunt.evidence import attach_evidence_chains
+        findings = attach_evidence_chains(engine, findings)
+    except Exception:
+        traceback.print_exc()
     if _store is not None:
         try:
             _store.record_hunt_run(N_NODES, N_EDGES, findings, ENGINE_SOURCE)
@@ -371,7 +379,62 @@ def list_decisions(limit: int = 50):
             items = _store.list_decisions(limit=min(max(limit, 1), 200))
         except Exception:
             traceback.print_exc()
-    return {"decisions": items, "persisted": _store is not None and _store.is_configured()}
+    # Approval queue: irreversible actions waiting on an analyst, enriched
+    # with reversibility scores + business-impact cost. Never auto-executes.
+    queue = []
+    try:
+        from graphops.response.gate import list_queued
+        queue = list_queued(limit=min(max(limit, 1), 200))
+    except Exception:
+        traceback.print_exc()
+    return {"decisions": items, "queue": queue,
+            "persisted": _store is not None and _store.is_configured(),
+            "queue_persisted": bool(queue)}
+
+
+# ---------------------------------------------------------------------------
+# Reversibility-gated containment proposals.
+# POST /contain NEVER executes anything: reversible actions are auto-approved
+# as recommendations; irreversible ones are queued behind analyst approval.
+# ---------------------------------------------------------------------------
+class ContainRequest(BaseModel):
+    node_id: str
+    action: str
+    target: str = ""
+    context: dict = {}
+    requested_by: str = "analyst"
+
+
+@app.post("/contain")
+def propose_containment(req: ContainRequest):
+    try:
+        from graphops.response.gate import evaluate_action, queue_action
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="containment gate unavailable")
+    try:
+        decision = evaluate_action(req.action, req.node_id, req.target, req.context)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    queued_record, store = None, None
+    if decision["status"] == "queued_for_approval":
+        try:
+            queued_record, store = queue_action(decision, requested_by=req.requested_by)
+        except Exception:
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail="failed to queue action")
+    return {"ok": True, "gate": decision, "queued": queued_record, "store": store}
+
+
+@app.get("/contain/actions")
+def list_containment_actions():
+    try:
+        from graphops.response.gate import ACTION_CATALOG, AUTO_APPROVE_MIN_REVERSIBILITY
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="containment gate unavailable")
+    return {"actions": ACTION_CATALOG,
+            "auto_approve_min_reversibility": AUTO_APPROVE_MIN_REVERSIBILITY}
 
 
 @app.get("/hunt-runs")

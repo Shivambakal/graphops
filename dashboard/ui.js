@@ -103,7 +103,10 @@ const UI = (() => {
       if (d) {
         window.Graph3D.setData(d.nodes, d.edges);
         const b = ops.getBlast ? ops.getBlast() : null;
-        if (b) window.Graph3D.setBlast(b.set, b.risk);
+        if (b) {
+          window.Graph3D.setBlast(b.set, b.risk);
+          if (window.Graph3D.setExfil && b.exfil) window.Graph3D.setExfil(b.exfil);
+        }
         const p = ops.getAttackPath ? ops.getAttackPath() : null;
         if (p) window.Graph3D.setAttackPath(p);
       }
@@ -125,10 +128,16 @@ const UI = (() => {
   const paletteCommands = () => {
     const ops = OPS();
     const cmds = [
-      { title: 'Run hunt', hint: 'POST /hunt', run: () => ops.runHunt && ops.runHunt() },
-      { title: 'Run demo attack scenario', hint: 'hunt + highlight', run: () => ops.runDemo && ops.runDemo() },
+      { title: 'Run hunt', hint: 'POST /hunt · H', run: () => ops.runHunt && ops.runHunt({}) },
+      { title: 'Run demo attack scenario', hint: 'hunt + highlight · D', run: () => ops.runDemo && ops.runDemo() },
+      { title: (ops.isAutoRefresh && ops.isAutoRefresh()) ? 'Pause hunt auto-refresh' : 'Resume hunt auto-refresh',
+        hint: '45s polling', run: () => ops.toggleAutoRefresh && ops.toggleAutoRefresh() },
+      { title: 'Open evidence chain (latest finding)', hint: 'E', run: () => {
+          const fs = ops.getFindings ? ops.getFindings() : [];
+          if (fs.length && ops.openEvidence) ops.openEvidence(fs[0]);
+        } },
       { title: mode === '2d' ? 'Switch to 3D graph' : 'Switch to 2D graph', hint: 'toggle view', run: () => setView(mode === '2d' ? '3d' : '2d') },
-      { title: 'Clear highlights', hint: 'attack path + blast', run: () => ops.clearHighlights && ops.clearHighlights() },
+      { title: 'Clear highlights', hint: 'attack path + blast · C', run: () => { ops.clearHighlights && ops.clearHighlights(); ops.closeDrawer && ops.closeDrawer(); } },
     ];
     const findings = ops.getFindings ? ops.getFindings() : [];
     findings.forEach((f, i) => {
@@ -215,6 +224,26 @@ const UI = (() => {
     if (btn) btn.addEventListener('click', openPalette);
   }
 
+  /* ---------- SOC keyboard shortcuts (single key, outside inputs) ---------- */
+  function wireShortcuts() {
+    document.addEventListener('keydown', (ev) => {
+      if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+      if (palOpen) return;
+      const tag = (document.activeElement && document.activeElement.tagName) || '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      const ops = OPS();
+      const k = ev.key.toLowerCase();
+      if (k === 'h') { ops.runHunt && ops.runHunt({}); }
+      else if (k === 'd') { ops.runDemo && ops.runDemo(); }
+      else if (k === 'c') { ops.clearHighlights && ops.clearHighlights(); if (ops.closeDrawer) ops.closeDrawer(); }
+      else if (k === 'e') {
+        const fs = ops.getFindings ? ops.getFindings() : [];
+        if (fs.length && ops.openEvidence) ops.openEvidence(fs[0]);
+        else if (ops.toast) ops.toast('Run a hunt first — no findings yet', 'warn');
+      }
+    });
+  }
+
   function wireToggle() {
     const b2 = $('btnView2d'), b3 = $('btnView3d');
     if (b2) b2.addEventListener('click', () => setView('2d'));
@@ -224,6 +253,7 @@ const UI = (() => {
   window.addEventListener('DOMContentLoaded', () => {
     entrance();
     wirePalette();
+    wireShortcuts();
     wireToggle();
   });
 

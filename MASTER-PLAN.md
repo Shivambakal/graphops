@@ -28,7 +28,9 @@ Full judge reasoning: JUDGE-INTEL.md. Reconstructed rubric: JUDGING-ALGO.md. Das
 
 ## 4. Accounts & tools checklist
 - [x] GitHub account (his) — repo creation + push needs his PAT (transient, like the Jarvis flow)
-- [ ] Neo4j Aura free tier — provisioning in progress (attacksurface.alerts@gmail.com)
+- [x] Neo4j Aura free tier — LIVE (2026-10-05): instance `graphops-hackfront` (badf36f3), status RUNNING, no card used.
+  URI `neo4j+s://badf36f3.databases.neo4j.io`, creds in gitignored `build/.neo4j-credentials.txt` (chmod 600).
+  Sandbox note: bolt driver fails here (DNS shimmed) — use the HTTPS Query API (`/db/badf36f3/query/v2`), verified working. Bolt is fine on his laptop / deployed backends.
 - [x] Vercel (his)
 - [x] Python/Node toolchains (sandbox + his laptop)
 - [x] Google SSO vault login for attacksurface.alerts@gmail.com (saved, do not delete)

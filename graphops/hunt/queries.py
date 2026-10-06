@@ -737,3 +737,116 @@ def hunt_lateral_movement_telemetry(engine: Any) -> List[Dict[str, Any]]:
             }
         )
     return findings
+
+
+# ---------------------------------------------------------------------------
+# hunt: OAuth scope creep (identity-trust layer)
+# ---------------------------------------------------------------------------
+
+_ADMIN_SCOPE_HINTS = ("admin", "write", "delete", "impersonate", "full_access")
+
+
+def _token_app(G: Any, token: Any) -> Optional[Any]:
+    """The oauth_app a token authorizes, or None."""
+    try:
+        for succ in G.successors(token):
+            info = _edge_info(G, token, succ)
+            if _edge_etype(info) == "authorizes" and _node_type(succ) == "oauth_app":
+                return succ
+    except Exception:
+        pass
+    return None
+
+
+def _token_user(G: Any, token: Any) -> Optional[Any]:
+    """The user who was granted the token, or None."""
+    try:
+        for pred in G.predecessors(token):
+            info = _edge_info(G, pred, token)
+            if _edge_etype(info) == "grants":
+                return pred
+    except Exception:
+        pass
+    return None
+
+
+def _regulated_datasets_for_scopes(G: Any, scopes: List[str]) -> List[Any]:
+    """Regulated datasets reachable via scope --accesses--> dataset edges."""
+    regulated: List[Any] = []
+    try:
+        for scope_name in scopes:
+            scope_id = f"oauth_scope:{scope_name}"
+            if scope_id not in G:
+                continue
+            for succ in G.successors(scope_id):
+                if _node_type(succ) != "dataset":
+                    continue
+                attrs = _node_attrs(G, succ)
+                if _is_truthy(attrs.get("regulated")) and succ not in regulated:
+                    regulated.append(succ)
+    except Exception:
+        pass
+    return regulated
+
+
+def hunt_oauth_scope_creep(engine: Any) -> List[Dict[str, Any]]:
+    """Find OAuth tokens granted scopes beyond their app's baseline.
+
+    A token creeps when its granted scope set exceeds the authorizing app's
+    baseline_scopes. Findings are critical when a creep scope is admin-level
+    AND reaches a regulated dataset, else high. Each finding traces
+    user -> token -> app -> scope -> dataset.
+    """
+    G = _get_graph(engine)
+    if G is None:
+        return []
+    findings: List[Dict[str, Any]] = []
+    try:
+        nodes = list(G.nodes())
+    except Exception:
+        return []
+    for token in nodes:
+        if _node_type(token) != "oauth_token":
+            continue
+        tattrs = _node_attrs(G, token)
+        scopes = tattrs.get("scopes") or []
+        if not isinstance(scopes, (list, tuple)) or not scopes:
+            continue
+        app = _token_app(G, token)
+        if app is None:
+            continue
+        baseline = _node_attrs(G, app).get("baseline_scopes") or []
+        baseline = {str(s) for s in baseline}
+        creep = [str(s) for s in scopes if str(s) not in baseline]
+        if not creep:
+            continue
+        adminish = [s for s in creep
+                    if any(h in s.lower() for h in _ADMIN_SCOPE_HINTS)]
+        regulated = _regulated_datasets_for_scopes(G, creep)
+        user = _token_user(G, token)
+        severity = "critical" if (adminish and regulated) else "high"
+        evidence = [
+            f"{token} (app {app}) granted {len(creep)} scope(s) beyond baseline: "
+            f"{', '.join(creep)}",
+            f"app baseline: {', '.join(sorted(baseline)) or 'none recorded'}",
+        ]
+        if adminish:
+            evidence.append(f"admin-level scopes granted: {', '.join(adminish)}")
+        if regulated:
+            evidence.append(
+                f"creep scopes reach regulated dataset(s): "
+                f"{', '.join(str(d) for d in regulated)}")
+        if user:
+            evidence.append(f"token held by {user}")
+        nodes_out = [n for n in [user, token, app] if n]
+        nodes_out += [f"oauth_scope:{s}" for s in creep]
+        nodes_out += list(regulated)
+        findings.append(
+            {
+                "title": f"OAuth scope creep: {token} over-scoped on {app}",
+                "severity": severity,
+                "evidence": evidence,
+                "nodes": nodes_out,
+            }
+        )
+    return findings

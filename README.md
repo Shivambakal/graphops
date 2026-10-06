@@ -1,3 +1,13 @@
+---
+title: GraphOps
+emoji: 🛡️
+colorFrom: red
+colorTo: indigo
+sdk: docker
+app_port: 8000
+pinned: false
+---
+
 # GraphOps
 
 Graph analytics for proactive threat hunting and blast-radius containment in security operations centers.
