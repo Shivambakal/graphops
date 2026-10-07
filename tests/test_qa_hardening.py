@@ -226,6 +226,16 @@ def test_containment_never_mutates_the_engine(engine):
         assert dict(d) == attrs_before[n], f"node {n} attrs mutated"
 
 
+def _stable_health(body):
+    """Normalize volatile /health diagnostic fields (probe latency)
+    before comparing snapshots."""
+    body = dict(body)
+    neo = dict(body.get("neo4j") or {})
+    neo.pop("latency_ms", None)
+    body["neo4j"] = neo
+    return body
+
+
 def test_approved_decision_has_no_side_effects(client):
     node_id = client.get("/graph").json()["nodes"][0]["id"]
     before = client.get("/health").json()
@@ -239,7 +249,7 @@ def test_approved_decision_has_no_side_effects(client):
     assert body["ok"] is True
     # approving an action is an audit record only: the graph, the node and
     # the blast-radius output must be completely unchanged
-    assert client.get("/health").json() == before
+    assert _stable_health(client.get("/health").json()) == _stable_health(before)
     assert node_id in {n["id"] for n in client.get("/graph").json()["nodes"][:500]}
 
 

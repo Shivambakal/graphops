@@ -74,6 +74,7 @@
   <strong>API offline</strong>
   <span>— start it with:</span>
   <code>uvicorn graphops.api.server:app</code>
+  <button id="btnRetryApi" class="btn primary sm">↻ retry connection</button>
 </div>
 
 <!-- ============ MAIN GRID ============ -->
@@ -91,6 +92,30 @@
       </div>
     </div>
     <p id="huntStatus" class="muted small">No hunt run yet. Findings come live from <code>POST /hunt</code>.</p>
+    <div class="hunt-filters" aria-label="Hunt filters">
+      <select id="huntSeverity" title="Filter findings by severity">
+        <option value="">severity: all</option>
+        <option value="critical">critical</option>
+        <option value="high">high</option>
+        <option value="medium">medium</option>
+        <option value="low">low</option>
+      </select>
+      <select id="huntMethod" title="Filter findings by detection method" disabled>
+        <option value="">method: all</option>
+      </select>
+      <select id="huntLimit" title="Findings per page">
+        <option value="3">3 / page</option>
+        <option value="5">5 / page</option>
+        <option value="10" selected>10 / page</option>
+        <option value="25">25 / page</option>
+        <option value="50">50 / page</option>
+      </select>
+    </div>
+    <div id="pageBar" class="page-bar" hidden>
+      <button id="btnPrevPage" class="btn ghost sm">← prev</button>
+      <span id="pageInfo" class="muted small"></span>
+      <button id="btnNextPage" class="btn ghost sm">next →</button>
+    </div>
     <div id="findingsList" class="findings"></div>
   </aside>
 
@@ -104,6 +129,7 @@
           <button id="btnView3d" role="tab" aria-selected="false">3D</button>
         </div>
         <span id="canvasStatus" class="muted small">layout idle</span>
+        <button id="btnColorMode" class="btn ghost sm" title="Toggle node coloring: entity type ↔ data classification (X)">◔ data color</button>
         <button id="btnDemo" class="btn accent">⚡ Run demo attack scenario</button>
       </div>
     </div>
@@ -118,26 +144,42 @@
         <span class="leg"><i style="--c:#fbbf24"></i>ip</span>
         <span class="leg"><i style="--c:#34d399"></i>process</span>
         <span class="leg"><i style="--c:#f87171"></i>alert</span>
+        <span class="leg legend-div">data:</span>
+        <span class="leg"><i class="dc-dot dc-public"></i>public</span>
+        <span class="leg"><i class="dc-dot dc-internal"></i>internal</span>
+        <span class="leg"><i class="dc-dot dc-confidential"></i>confidential</span>
+        <span class="leg"><i class="dc-dot dc-regulated"></i>regulated ⚠</span>
       </div>
     </div>
-    <p class="hint muted small">2D: drag nodes · hover for detail · click a node for blast radius · title click → evidence chain &nbsp;|&nbsp; 3D: drag to orbit · scroll to zoom · click a node for blast radius &nbsp;|&nbsp; keys: <code>H</code> hunt · <code>D</code> demo · <code>E</code> evidence · <code>C</code> clear · <code>⌘K</code> commands</p>
+    <p class="hint muted small">2D: drag nodes · hover for detail · click a node for blast radius · title click → evidence chain &nbsp;|&nbsp; 3D: drag to orbit · scroll to zoom · click a node for blast radius &nbsp;|&nbsp; keys: <code>H</code> hunt · <code>D</code> demo · <code>E</code> evidence · <code>C</code> clear · <code>T</code> tour · <code>X</code> color · <code>⌘K</code> commands</p>
   </section>
 
   <!-- RIGHT: blast radius -->
   <aside class="panel right" aria-label="Blast radius">
     <div class="panel-head">
       <h2>Blast radius</h2>
-      <span id="blastSource" class="muted small"></span>
+      <div class="blast-tools">
+        <button id="btnBlastTour" class="btn ghost sm" hidden title="Camera tour through the blast-radius path (3D)">▶ tour</button>
+        <span id="blastSource" class="muted small"></span>
+      </div>
     </div>
     <div class="human-gate">⛔ RECOMMENDED ONLY — human must approve; nothing auto-executes.</div>
-    <div id="blastEmpty" class="empty">Click any node (in findings or on the graph) to compute its blast radius via <code>POST /blast-radius</code>. External IP nodes in radius get an <b class="exfil-tag">EXFIL RISK</b> badge (suspected C2/exfil endpoint).</div>
+    <div id="blastEmpty" class="empty">Click any node (in findings or on the graph) to compute its blast radius via <code>POST /blast-radius</code>. External IP nodes in radius get an <b class="exfil-tag">EXFIL RISK</b> badge (suspected C2/exfil endpoint). Regulated-data nodes get a crimson halo — click one to jump to its DPDP notification scope.</div>
     <div id="blastResults" hidden>
+      <div id="dpdpCard" class="dpdp" hidden></div>
       <table class="blast-table">
         <thead><tr><th>node</th><th>distance</th><th>risk</th></tr></thead>
         <tbody id="blastRows"></tbody>
       </table>
       <h3 class="actions-head">Containment actions</h3>
       <div id="actionsList" class="actions"></div>
+    </div>
+
+    <h3 class="actions-head">Red-team replay</h3>
+    <div id="replay" class="replay">
+      <p id="scenarioStatus" class="muted small">Loading scripted scenarios from <code>GET /demo-scenarios</code>…</p>
+      <div id="scenarioList" class="scenarios"></div>
+      <div id="scenarioResult" class="scenario-result" hidden></div>
     </div>
   </aside>
 </main>

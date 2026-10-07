@@ -16,6 +16,12 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+try:
+    from graphops.graph.classification import classify_node as _classify
+except Exception:  # pragma: no cover
+    def _classify(_engine: Any, _node_id: str) -> str:
+        return "internal"
+
 MAX_ACTIONS = 25
 STATUS_RECOMMENDED = "recommended"
 
@@ -150,4 +156,14 @@ def recommend_containment(engine: Any, compromised_node: str) -> Dict[str, Any]:
             ))
 
     actions = p1 + p2
-    return {"blast_radius": radius, "actions": actions[:MAX_ACTIONS]}
+
+    # DPDP overlay: every blast-radius node carries its data classification
+    # (regulated/personal/internal/public) so analysts see at a glance which
+    # personal/regulated datasets a compromise exposes.
+    enriched_radius: Dict[str, Any] = {}
+    for node_id, info in radius.items():
+        info = dict(info or {})
+        info["data_classification"] = _classify(engine, node_id)
+        enriched_radius[node_id] = info
+
+    return {"blast_radius": enriched_radius, "actions": actions[:MAX_ACTIONS]}

@@ -14,6 +14,14 @@ const ETYPE_HEX = {
 };
 const ETYPE_DEFAULT = 0x94a3b8;
 const RISK_HEX = new THREE.Color(0xff2d55);
+const REGULATED_HEX = new THREE.Color(0xff2d55); // crimson — DPDP regulated-data halo
+// data-classification color mode (mirror of dashboard DC_COLORS, 2D↔3D sync)
+const DC_HEX = {
+  regulated: 0xff2d55,
+  confidential: 0xfbbf24,
+  internal: 0x38bdf8,
+  public: 0x5b6b82, // dim
+};
 
 const G = {
   inited: false,
@@ -25,11 +33,14 @@ const G = {
   nodes: [], edges: [],
   blastSet: new Set(), blastRisk: new Map(), attackSet: new Set(),
   exfilSet: new Set(),
+  regulatedSet: new Set(), // blast nodes holding regulated data (DPDP overlay, crimson halos)
+  regHalos: [],            // wireframe halo meshes for regulated nodes
   hovered: null,
   layout: null,        // {iter, total} while settling
   shockwaves: [],
   tooltip: null, container: null,
   onNodeClick: null,
+  colorMode: 'etype',  // 'etype' | 'dc' — synced from app.js toggle
   raf: 0, clock: new THREE.Clock(),
   sphereGeo: null,
 };
@@ -148,6 +159,8 @@ function clearGraph() {
   }
   for (const s of G.shockwaves) G.scene.remove(s.mesh);
   G.shockwaves = [];
+  for (const h of G.regHalos) { h.parent && h.parent.remove(h); h.geometry.dispose(); h.material.dispose(); }
+  G.regHalos = [];
 }
 
 function setData(nodes, edges) {
@@ -166,7 +179,8 @@ function setData(nodes, edges) {
     const mesh = new THREE.Mesh(G.sphereGeo, mat);
     const size = 1.6 + Math.min(4.2, (n.degree || 0) * 0.35);
     mesh.scale.setScalar(size);
-    mesh.userData = { id: n.id, label: n.label, etype: n.etype, baseSize: size, baseColor: color.clone() };
+    // contract: nodes may carry data_classification (public/internal/confidential/regulated)
+    mesh.userData = { id: n.id, label: n.label, etype: n.etype, baseSize: size, baseColor: color.clone(), dc: String(n.dc || '').toLowerCase() };
     // random point in sphere
     const th = Math.random() * Math.PI * 2;
     const ph = Math.acos(2 * Math.random() - 1);
@@ -201,6 +215,7 @@ function setData(nodes, edges) {
 
   // start progressive 3D layout
   G.layout = { iter: 0, total: 110 };
+  applyRegulatedHalos(); // rebuild halos after clearGraph wiped them (setRegulated may predate setData)
   applyBlastColors();
 }
 
@@ -286,17 +301,45 @@ function layoutStep() {
 }
 
 /* ---------- highlights ---------- */
+function isRegulatedMesh(u) {
+  return G.regulatedSet.has(u.id) || u.dc === 'regulated';
+}
+
+function applyRegulatedHalos() {
+  for (const h of G.regHalos) { h.parent && h.parent.remove(h); h.geometry.dispose(); h.material.dispose(); }
+  G.regHalos = [];
+  for (const mesh of G.meshes) {
+    if (!isRegulatedMesh(mesh.userData)) continue;
+    const halo = new THREE.Mesh(
+      new THREE.SphereGeometry(1.28, 18, 12),
+      new THREE.MeshBasicMaterial({ color: 0xff2d55, transparent: true, opacity: 0.5, wireframe: true })
+    );
+    halo.userData.isRegHalo = true;
+    mesh.add(halo); // follows the node automatically
+    G.regHalos.push(halo);
+  }
+}
+
 function applyBlastColors() {
   for (const mesh of G.meshes) {
     const u = mesh.userData;
     const risk = G.blastRisk.get(u.id);
+    const regulated = isRegulatedMesh(u);
+    // color-mode tint: node base color comes from data classification when enabled
+    const dcTint = (G.colorMode === 'dc' && u.dc && DC_HEX[u.dc] !== undefined)
+      ? new THREE.Color(DC_HEX[u.dc]) : null;
+    const base = dcTint || u.baseColor;
     if (G.exfilSet.has(u.id)) {
       // exfil-risk overlay wins: suspected C2/exfil endpoint, hot amber
       mesh.material.color.copy(EXFIL_HEX);
       mesh.material.emissive.copy(EXFIL_HEX).multiplyScalar(0.7);
+    } else if (regulated) {
+      // DPDP regulated-data overlay: crimson tint, halo marks it in any blast state
+      mesh.material.color.copy(u.baseColor).lerp(REGULATED_HEX, 0.72);
+      mesh.material.emissive.copy(REGULATED_HEX).multiplyScalar(0.55);
     } else if (risk !== undefined && risk !== null && Number.isFinite(Number(risk))) {
       const rn = Math.max(0, Math.min(1, Number(risk) <= 1 ? Number(risk) : Number(risk) / 100));
-      mesh.material.color.copy(u.baseColor).lerp(RISK_HEX, 0.25 + rn * 0.65);
+      mesh.material.color.copy(base).lerp(RISK_HEX, 0.25 + rn * 0.65);
       mesh.material.emissive.copy(mesh.material.color).multiplyScalar(0.55);
     } else if (G.blastSet.has(u.id)) {
       mesh.material.color.set(0x22d3ee);
@@ -306,10 +349,17 @@ function applyBlastColors() {
       mesh.material.color.copy(u.baseColor);
       mesh.material.emissive.copy(u.baseColor).multiplyScalar(0.55);
     } else {
-      mesh.material.color.copy(u.baseColor);
-      mesh.material.emissive.copy(u.baseColor).multiplyScalar(0.25);
+      mesh.material.color.copy(base);
+      mesh.material.emissive.copy(base).multiplyScalar(0.25);
     }
   }
+}
+
+/* ---------- node color mode: entity type <-> data classification ---------- */
+function setColorMode(m) {
+  G.colorMode = m === 'dc' ? 'dc' : 'etype';
+  if (!G.inited) return;
+  applyBlastColors();
 }
 
 function setBlast(idSet, riskById) {
@@ -344,6 +394,55 @@ function setExfil(idSet) {
   G.exfilSet = new Set(idSet || []);
   if (!G.inited) return;
   applyBlastColors();
+}
+
+/* ---------- DPDP overlay: crimson halos on nodes holding regulated data ---------- */
+function setRegulated(idSet) {
+  G.regulatedSet = new Set(idSet || []);
+  if (!G.inited) return;
+  applyRegulatedHalos();
+  applyBlastColors();
+}
+
+/* ---------- camera tour through the blast-radius path (GSAP timeline) ---------- */
+function tourBlast(rows) {
+  if (!G.inited) return false;
+  const seq = (rows || [])
+    .slice(0, 10) // keep the tour tight: nearest 10 nodes by distance
+    .map((r) => G.meshById.get(r.id ?? r))
+    .filter(Boolean);
+  if (!seq.length) return false;
+  const g = window.gsap;
+  if (G.controls) G.controls.autoRotate = false;
+  if (!g) { flyTo(seq[0].userData.id); return true; }
+  const tl = g.timeline({ defaults: { duration: 1.15, ease: 'power2.inOut' } });
+  for (const mesh of seq) {
+    const target = mesh.position.clone();
+    const dir = G.camera.position.clone().sub(target);
+    if (dir.length() < 1e-3) dir.set(0.4, 0.35, 1);
+    dir.normalize().multiplyScalar(95);
+    const camTo = target.clone().add(dir);
+    tl.to(G.camera.position, {
+      x: camTo.x, y: camTo.y, z: camTo.z,
+      onUpdate: () => { if (G.controls) G.controls.update(); },
+    }, '>');
+    tl.to(G.controls ? G.controls.target : {}, {
+      x: target.x, y: target.y, z: target.z,
+      onUpdate: () => { if (G.controls) G.controls.update(); },
+    }, '<');
+    // attention ping as the tour reaches each node
+    tl.add(() => {
+      const sm = new THREE.Mesh(
+        new THREE.SphereGeometry(1, 18, 12),
+        new THREE.MeshBasicMaterial({ color: 0xff2d55, transparent: true, opacity: 0.6, wireframe: true })
+      );
+      sm.position.copy(target);
+      sm.scale.setScalar(mesh.userData.baseSize);
+      G.scene.add(sm);
+      G.shockwaves.push({ mesh: sm, t: 0 });
+    }, '-=0.35');
+  }
+  return true;
 }
 
 /* ---------- camera fly-to on selection ---------- */
@@ -416,8 +515,8 @@ function wirePointer() {
       tt.style.top = Math.max(((-v.y + 1) / 2) * r.height - 12, 8) + 'px';
       tt.innerHTML =
         `<span class="tt-id">${escapeHtml(u.label)}</span><br>` +
-        `<span class="tt-type">${escapeHtml(u.etype)}</span><br>` +
-        `<span class="muted">click → blast radius</span>`;
+        `<span class="tt-type">${escapeHtml(u.etype)}${u.dc ? ` · ${escapeHtml(u.dc)}` : ''}</span><br>` +
+        `<span class="muted">${isRegulatedMesh(u) ? 'regulated data — click → DPDP' : 'click → blast radius'}</span>`;
     } else if (tt) {
       tt.hidden = true;
     }
@@ -460,6 +559,8 @@ function tick() {
       mesh.material.emissive.setHex(0xf87171).multiplyScalar(0.55 + 0.3 * Math.sin(t * 6));
     } else if (G.exfilSet.has(id)) {
       s *= 1 + 0.22 * Math.sin(t * 5 + 0.6); // exfil-risk pulse (suspected C2)
+    } else if (G.regulatedSet.has(id) || u.dc === 'regulated') {
+      s *= 1 + 0.18 * Math.sin(t * 4.5 + 0.9); // regulated-data pulse (DPDP overlay)
     } else if (G.blastSet.has(id)) {
       s *= 1 + 0.16 * Math.sin(t * 4 + 1);
     } else if (G.hovered === mesh) {
@@ -496,4 +597,15 @@ function setVisible(v) {
   }
 }
 
-window.Graph3D = { init, setData, setBlast, setExfil, setAttackPath, setVisible, resize, flyTo };
+window.Graph3D = {
+  init, setData, setBlast, setExfil, setAttackPath, setVisible, resize, flyTo,
+  setRegulated, tourBlast, setColorMode,
+  // read-only debug surface for automated verification (no state mutation)
+  debug: () => ({
+    nodes: G.meshes.length,
+    regulated: G.regulatedSet.size,
+    halos: G.regHalos.length,
+    colorMode: G.colorMode,
+    tourCapable: typeof tourBlast === 'function',
+  }),
+};

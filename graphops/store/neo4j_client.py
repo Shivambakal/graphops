@@ -22,6 +22,7 @@ import time
 import urllib.request
 import urllib.error
 from pathlib import Path
+from typing import Any, Dict
 
 _TIMEOUT = 60
 _BATCH = 500
@@ -115,6 +116,51 @@ def run_cypher(statement: str, params: dict | None = None):
     fields = data.get("fields") or []
     values = data.get("values") or []
     return [dict(zip(fields, row)) for row in values]
+
+
+def ping(timeout: float = 5.0) -> Dict[str, Any]:
+    """Liveness check against the Neo4j HTTPS Query API.
+
+    Returns {"reachable": bool, "latency_ms": int|None, "error": str|None}.
+    Never raises, never logs credentials. Uses its own short timeout so a
+    health endpoint can call it safely.
+    """
+    import time as _time
+
+    if not is_configured():
+        return {"reachable": False, "latency_ms": None,
+                "error": "neo4j not configured"}
+    cfg = _cfg()
+    if not cfg:
+        return {"reachable": False, "latency_ms": None,
+                "error": "neo4j credentials unresolved"}
+    url, user, pw, _db = cfg
+    auth = base64.b64encode(f"{user}:{pw}".encode()).decode()
+    req = urllib.request.Request(
+        url,
+        data=json.dumps({"statement": "RETURN 1 AS ok"}).encode(),
+        headers={
+            "Authorization": f"Basic {auth}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    started = _time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = json.loads(r.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        return {"reachable": False, "latency_ms": None,
+                "error": f"http {e.code}"}
+    except Exception as e:
+        return {"reachable": False, "latency_ms": None,
+                "error": _redact(str(e))[:120]}
+    latency = int((_time.time() - started) * 1000)
+    if body.get("errors"):
+        return {"reachable": False, "latency_ms": latency,
+                "error": _redact(json.dumps(body["errors"])[:120])}
+    return {"reachable": True, "latency_ms": latency, "error": None}
 
 
 def _scalar(v):

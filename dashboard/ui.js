@@ -78,6 +78,14 @@ const UI = (() => {
     const ops = OPS();
     if (next === '3d') {
       if (threeFailed || !window.Graph3D) { threeFailed = true; return false; }
+      // explicit empty state: refuse 3D when there is no graph data to show
+      const gd = ops.getGraphData ? ops.getGraphData() : null;
+      if (!gd || !gd.nodes.length) {
+        const cs = $('canvasStatus');
+        if (cs) cs.textContent = '3D unavailable — no graph data (API offline or empty graph)';
+        if (ops.toast) ops.toast('3D needs graph data — API offline or the graph is empty', 'warn');
+        return false;
+      }
     }
     mode = next;
     const b2 = $('btnView2d'), b3 = $('btnView3d');
@@ -102,6 +110,9 @@ const UI = (() => {
       const d = ops.getGraphData ? ops.getGraphData() : null;
       if (d) {
         window.Graph3D.setData(d.nodes, d.edges);
+        if (typeof window.Graph3D.setColorMode === 'function' && ops.getColorMode) {
+          window.Graph3D.setColorMode(ops.getColorMode()); // keep 2D/3D color mode in sync
+        }
         const b = ops.getBlast ? ops.getBlast() : null;
         if (b) {
           window.Graph3D.setBlast(b.set, b.risk);
@@ -130,6 +141,11 @@ const UI = (() => {
     const cmds = [
       { title: 'Run hunt', hint: 'POST /hunt · H', run: () => ops.runHunt && ops.runHunt({}) },
       { title: 'Run demo attack scenario', hint: 'hunt + highlight · D', run: () => ops.runDemo && ops.runDemo() },
+      { title: 'Open red-team replay panel', hint: 'demo scenarios · metrics · copy demo script',
+        run: () => { const r = document.getElementById('replay'); if (r) r.scrollIntoView({ behavior: 'smooth', block: 'start' }); } },
+      { title: 'Blast-radius camera tour (3D)', hint: 'cinematic path · T', run: () => ops.tourBlastView && ops.tourBlastView() },
+      { title: 'Toggle node coloring: entity type ↔ data classification', hint: 'X', run: () => ops.toggleColorMode && ops.toggleColorMode() },
+      { title: 'Retry API connection', hint: 'restore offline dashboard', run: () => ops.retryConnection && ops.retryConnection() },
       { title: (ops.isAutoRefresh && ops.isAutoRefresh()) ? 'Pause hunt auto-refresh' : 'Resume hunt auto-refresh',
         hint: '45s polling', run: () => ops.toggleAutoRefresh && ops.toggleAutoRefresh() },
       { title: 'Open evidence chain (latest finding)', hint: 'E', run: () => {
@@ -235,6 +251,8 @@ const UI = (() => {
       const k = ev.key.toLowerCase();
       if (k === 'h') { ops.runHunt && ops.runHunt({}); }
       else if (k === 'd') { ops.runDemo && ops.runDemo(); }
+      else if (k === 't') { ops.tourBlastView && ops.tourBlastView(); }
+      else if (k === 'x') { ops.toggleColorMode && ops.toggleColorMode(); }
       else if (k === 'c') { ops.clearHighlights && ops.clearHighlights(); if (ops.closeDrawer) ops.closeDrawer(); }
       else if (k === 'e') {
         const fs = ops.getFindings ? ops.getFindings() : [];

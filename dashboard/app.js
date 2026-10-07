@@ -26,8 +26,14 @@ const EP_HUNT = API_BASE + '/hunt';
 const EP_BLAST = API_BASE + '/blast-radius';
 const EP_GRAPH = API_BASE + '/graph';
 const EP_DECISIONS = API_BASE + '/decisions';
+const EP_DEMO_SCENARIOS = API_BASE + '/demo-scenarios';
+const EP_DEMO_RUN = (id) => API_BASE + '/demo-scenarios/' + encodeURIComponent(id) + '/run';
+// new red-team contract (backend ships it alongside/after the demo contract)
+const EP_REDEAM_SCENARIOS = API_BASE + '/redteam/scenarios';
+const EP_REDEAM_RUN = (id) => API_BASE + '/redteam/run/' + encodeURIComponent(id);
 const START_CMD = 'uvicorn graphops.api.server:app';
 const HUNT_AUTORELOAD_MS = 45000; // findings feed auto-refresh interval
+const HUNT_DEFAULT_LIMIT = 10;
 
 const ETYPE_COLORS = {
   host: '#38bdf8',
@@ -37,6 +43,13 @@ const ETYPE_COLORS = {
   alert: '#f87171',
 };
 const ETYPE_DEFAULT = '#94a3b8';
+// data-classification color mode (toggle): uses real node attrs, zero hardcoding of values
+const DC_COLORS = {
+  regulated: '#ff2d55',
+  confidential: '#fbbf24',
+  internal: '#38bdf8',
+  public: '#5b6b82', // dim
+};
 
 /* ================= state ================= */
 const state = {
@@ -48,6 +61,7 @@ const state = {
   attackPath: new Set(), // node ids highlighted by demo scenario
   blastSet: new Set(),   // node ids in current blast radius
   exfilSet: new Set(),   // blast nodes at distance<=1 that are external IPs (exfil risk overlay)
+  dpdpRegulatedSet: new Set(), // blast nodes holding regulated data (crimson halo)
   decisions: new Map(),  // "action|target" -> "approved" | "rejected" (analyst audit trail)
   drawerFinding: null,   // finding currently shown in the evidence drawer
   autoRefreshOn: true,   // hunt feed polling
@@ -55,6 +69,18 @@ const state = {
   dragged: null,
   layoutDone: false,
   apiUp: false,
+  // hunt filters + pagination (contract: GET /hunt?severity=&method=&limit=&offset=;
+  // falls back to POST /hunt + client-side filter/paginate when the backend lacks it)
+  hunt: { severity: '', method: '', limit: HUNT_DEFAULT_LIMIT, offset: 0, total: null, serverMode: 'get' },
+  // red-team replay (dual contract: GET /redteam/scenarios -> POST /redteam/run/{id},
+  // legacy: GET /demo-scenarios -> POST /demo-scenarios/{id}/run)
+  scenarios: [], scenariosState: 'idle', scenarioContract: null,
+  lastScenarioRun: null,
+  // 2D/3D node color mode: 'etype' | 'dc' (data classification)
+  colorMode: 'etype',
+  // decision-audit persistence: null = unknown (GET /decisions unreachable),
+  // true = persisted (Supabase store configured), false = in-memory only
+  persisted: null, queuePersisted: null,
 };
 
 /* ================= dom ================= */
@@ -68,10 +94,17 @@ const el = {
   canvasStatus: $('canvasStatus'),
   blastEmpty: $('blastEmpty'), blastResults: $('blastResults'),
   blastSource: $('blastSource'), blastRows: $('blastRows'), actionsList: $('actionsList'),
+  dpdpCard: $('dpdpCard'), btnBlastTour: $('btnBlastTour'),
   footStamp: $('footStamp'),
   toasts: $('toasts'), drawer: $('drawer'), drawerSub: $('drawerSub'),
   drawerBody: $('drawerBody'), btnDrawerClose: $('btnDrawerClose'),
   autoRefresh: $('autoRefresh'),
+  huntSeverity: $('huntSeverity'), huntMethod: $('huntMethod'), huntLimit: $('huntLimit'),
+  pageBar: $('pageBar'), pageInfo: $('pageInfo'),
+  btnPrevPage: $('btnPrevPage'), btnNextPage: $('btnNextPage'),
+  scenarioStatus: $('scenarioStatus'), scenarioList: $('scenarioList'),
+  scenarioResult: $('scenarioResult'),
+  btnRetryApi: $('btnRetryApi'), btnColorMode: $('btnColorMode'),
 };
 
 /* ================= toasts ================= */
@@ -137,10 +170,15 @@ async function init() {
   sizeCanvas();
   window.addEventListener('resize', () => { sizeCanvas(); draw(); });
   wireCanvas();
-  el.btnRunHunt.addEventListener('click', () => runHunt());
+  el.btnRunHunt.addEventListener('click', () => { state.hunt.offset = 0; runHunt(); });
   el.btnDemo.addEventListener('click', runDemoScenario);
   el.btnDrawerClose.addEventListener('click', closeDrawer);
   el.autoRefresh.addEventListener('change', () => setAutoRefresh(el.autoRefresh.checked));
+  wireHuntFilters();
+  if (el.btnBlastTour) el.btnBlastTour.addEventListener('click', tourBlastView);
+  if (el.btnRetryApi) el.btnRetryApi.addEventListener('click', retryConnection);
+  if (el.btnColorMode) el.btnColorMode.addEventListener('click', toggleColorMode);
+  renderQueueEmpty(); // explicit pre-blast empty state for the containment queue
   document.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape' && !el.drawer.hidden) closeDrawer();
   });
@@ -151,6 +189,7 @@ async function init() {
   setOnline();
   setAutoRefresh(true); // findings feed: live polling
   await loadGraph();
+  await loadScenarios();
   if (window.UI) UI.bootDone();
 }
 
@@ -195,6 +234,8 @@ function setOffline() {
   el.btnDemo.disabled = true;
   el.huntStatus.textContent = 'Cannot run hunt — API is offline.';
   el.canvasStatus.textContent = 'no data (API offline)';
+  if (el.scenarioStatus) el.scenarioStatus.textContent = 'Red-team replay unavailable — API is offline.';
+  if (el.btnBlastTour) el.btnBlastTour.hidden = true;
   if (autoTimer) { clearInterval(autoTimer); autoTimer = null; } // halt feed polling
 }
 function setOnline() {
@@ -204,7 +245,53 @@ function setOnline() {
   el.btnDemo.disabled = false;
 }
 
-/* ================= graph ================= */
+/* Explicit offline retry — re-probes /health and restores the full boot
+ * sequence (graph, scenarios, hunt feed) when the API comes back. */
+async function retryConnection() {
+  toast('Retrying API connection…', 'info');
+  el.offlineBanner.hidden = true;
+  const up = await checkHealth();
+  if (!up) {
+    setOffline();
+    toast('API still offline — start it with: ' + START_CMD, 'err');
+    return;
+  }
+  setOnline();
+  setAutoRefresh(true);
+  await loadGraph();
+  await loadScenarios();
+  await runHunt({ silent: true });
+  toast('API back online — graph, scenarios and feed restored', 'ok');
+}
+
+/* ================= node color mode: entity type <-> data classification ================= */
+function nodeFill(n) {
+  if (state.colorMode === 'dc' && n.dc && DC_COLORS[n.dc]) return DC_COLORS[n.dc];
+  return ETYPE_COLORS[n.etype] || ETYPE_DEFAULT;
+}
+
+function toggleColorMode() {
+  state.colorMode = state.colorMode === 'etype' ? 'dc' : 'etype';
+  const dcOn = state.colorMode === 'dc';
+  const b = el.btnColorMode;
+  if (b) {
+    b.classList.toggle('active', dcOn);
+    b.textContent = dcOn ? '◑ type color' : '◔ data color';
+    b.title = dcOn
+      ? 'Nodes colored by data classification — click to switch back to entity type (X)'
+      : 'Toggle node coloring: entity type ↔ data classification (X)';
+  }
+  el.canvasStatus.textContent = dcOn
+    ? 'node color = data classification · regulated red · confidential amber · internal blue · public dim'
+    : `${state.nodes.length} nodes · ${state.edges.length} edges`;
+  if (window.Graph3D && typeof window.Graph3D.setColorMode === 'function') {
+    window.Graph3D.setColorMode(state.colorMode);
+  }
+  draw();
+  toast(dcOn
+    ? 'Nodes colored by data classification (real node attrs from the API)'
+    : 'Nodes colored by entity type', 'info');
+}
 async function loadGraph() {
   el.canvasStatus.textContent = 'fetching graph…';
   try {
@@ -216,6 +303,9 @@ async function loadGraph() {
         id: String(nodeIdOf(n) ?? ''),
         etype: nodeTypeOf(n),
         label: String(nodeLabelOf(n)),
+        // contract: nodes may carry data_classification (public/internal/confidential/regulated)
+        // + regulated_reachable from /blast-radius rows; all optional, all defensive
+        dc: String(n.data_classification ?? n.classification ?? '').toLowerCase() || '',
         x: 0, y: 0, r: 7, degree: 0,
       }))
       .filter((n) => n.id);
@@ -356,12 +446,20 @@ function draw() {
   // nodes
   const showAllLabels = state.nodes.length > 0 && state.nodes.length <= 50;
   for (const n of state.nodes) {
-    const color = ETYPE_COLORS[n.etype] || ETYPE_DEFAULT;
+    const color = nodeFill(n);
     const isBlast = state.blastSet.has(n.id);
     const isPath = state.attackPath.has(n.id);
     const isExfil = state.exfilSet.has(n.id);
+    const isRegulated = state.dpdpRegulatedSet.has(n.id) || n.dc === 'regulated';
     const isHover = state.hovered === n;
 
+    if (isRegulated) { // regulated data: crimson halo (DPDP overlay)
+      const pr = n.r + 12 + Math.sin(t * 4.5) * 2.5;
+      ctx.strokeStyle = 'rgba(255,45,85,0.9)'; ctx.lineWidth = 2.5;
+      ctx.shadowColor = '#ff2d55'; ctx.shadowBlur = 16;
+      ctx.beginPath(); ctx.arc(n.x, n.y, pr, 0, Math.PI * 2); ctx.stroke();
+      ctx.shadowBlur = 0;
+    }
     if (isPath) { // pulsing attack-path ring
       const pr = n.r + 9 + Math.sin(t * 5) * 3;
       ctx.strokeStyle = 'rgba(248,113,113,0.9)'; ctx.lineWidth = 2.5;
@@ -427,8 +525,8 @@ function wireCanvas() {
       el.tooltip.style.top = Math.max(p.y - 10, 8) + 'px';
       el.tooltip.innerHTML =
         `<span class="tt-id">${esc(n.label)}</span><br>` +
-        `<span class="tt-type">${esc(n.etype)} · degree ${n.degree}</span><br>` +
-        `<span class="muted">click → blast radius</span>`;
+        `<span class="tt-type">${esc(n.etype)} · degree ${n.degree}${n.dc ? ` · <span class="dc dc-${n.dc}">${esc(n.dc)}</span>` : ''}</span><br>` +
+        `<span class="muted">${state.dpdpRegulatedSet.has(n.id) ? 'regulated data — click → blast radius + DPDP' : 'click → blast radius'}</span>`;
       c.style.cursor = 'pointer';
     } else {
       el.tooltip.hidden = true;
@@ -446,31 +544,103 @@ function wireCanvas() {
   window.addEventListener('mouseup', () => { state.dragged = null; });
   c.addEventListener('click', (ev) => {
     const n = nearest(pos(ev));
-    if (n) runBlastRadius(n.id);
+    if (n) handleNodeClick(n.id);
   });
 }
 
 /* ================= hunt ================= */
+/* ================= hunt (filters + pagination + 45s auto-refresh) =================
+ * Contract: GET /hunt gains ?severity=&method=&limit=&offset=.
+ * Falls back to POST /hunt + client-side filter/paginate when the backend lacks GET /hunt.
+ * Everything rendered comes from the API; auto-refresh keeps current filters;
+ * offline halts polling (setOffline clears the timer).
+ */
+function wireHuntFilters() {
+  el.huntSeverity.addEventListener('change', () => {
+    state.hunt.severity = el.huntSeverity.value;
+    state.hunt.offset = 0;
+    runHunt();
+  });
+  el.huntMethod.addEventListener('change', () => {
+    state.hunt.method = el.huntMethod.value;
+    state.hunt.offset = 0;
+    runHunt();
+  });
+  el.huntLimit.addEventListener('change', () => {
+    state.hunt.limit = Number(el.huntLimit.value) || HUNT_DEFAULT_LIMIT;
+    state.hunt.offset = 0;
+    runHunt();
+  });
+  el.btnPrevPage.addEventListener('click', () => {
+    state.hunt.offset = Math.max(0, state.hunt.offset - state.hunt.limit);
+    runHunt({ silent: true });
+  });
+  el.btnNextPage.addEventListener('click', () => {
+    state.hunt.offset += state.hunt.limit;
+    runHunt({ silent: true });
+  });
+}
+
 async function runHunt({ silent = false } = {}) {
   el.btnRunHunt.disabled = true;
   if (!silent) {
-    el.huntStatus.textContent = 'hunting… (POST /hunt)';
+    el.huntStatus.textContent = 'hunting…';
     renderHuntSkeletons();
   }
+  const f = state.hunt;
+  let raw = [];
+  let total = null;
   try {
-    const data = await apiFetch(EP_HUNT, { method: 'POST' });
-    const raw = data.findings ?? data.results ?? [];
-    state.findings = raw.map(normalizeFinding).filter((f) => f.title);
+    if (f.serverMode === 'get') {
+      // contract path: GET /hunt?severity=&method=&limit=&offset=
+      const params = new URLSearchParams();
+      if (f.severity) params.set('severity', f.severity);
+      if (f.method) params.set('method', f.method);
+      params.set('limit', String(f.limit));
+      params.set('offset', String(f.offset));
+      try {
+        const data = await apiFetch(EP_HUNT + '?' + params.toString());
+        raw = data.findings ?? data.results ?? [];
+        total = data.total ?? data.count ?? (Array.isArray(raw) ? raw.length : null);
+      } catch (e) {
+        if (/HTTP 404|HTTP 405|HTTP 501/.test(e.message)) {
+          // backend build without GET /hunt — downgrade once per session
+          f.serverMode = 'post';
+          toast('This backend build has no GET /hunt — filters applied client-side', 'warn');
+        } else throw e;
+      }
+    }
+    if (f.serverMode === 'post') {
+      // legacy path: POST /hunt ignores params; filter + paginate client-side over real data
+      const data = await apiFetch(EP_HUNT, { method: 'POST' });
+      let arr = data.findings ?? data.results ?? [];
+      if (f.severity) arr = arr.filter((x) => String(x.severity ?? x.level ?? '').toLowerCase() === f.severity);
+      if (f.method) {
+        const m = f.method.toLowerCase();
+        arr = arr.filter((x) => findingMethod(x).toLowerCase() === m);
+      }
+      total = arr.length;
+      raw = arr.slice(f.offset, f.offset + f.limit);
+    }
+    state.findings = raw.map(normalizeFinding).filter((x) => x.title);
+    state.hunt.total = total;
     renderFindings();
+    renderPageBar();
+    populateMethodOptions(raw);
     if (!silent && window.UI) {
       UI.animateFindings();
-      UI.countUp(document.getElementById('statFindings'), state.findings.length, { dur: 0.7 });
+      UI.countUp(document.getElementById('statFindings'), total ?? state.findings.length, { dur: 0.7 });
     }
     const stamp = ` · ${new Date().toLocaleTimeString()}`;
+    const bits = [];
+    if (f.severity) bits.push('sev=' + f.severity);
+    if (f.method) bits.push('method=' + f.method);
+    const filterNote = bits.length ? ` · filters: ${bits.join(', ')}` : '';
+    const totalNote = total !== null ? ` of ${total}` : '';
     el.huntStatus.innerHTML =
       state.findings.length === 0
-        ? `Hunt complete — no findings returned.${stamp}`
-        : `Hunt complete — <b>${state.findings.length}</b> finding${state.findings.length > 1 ? 's' : ''}${stamp}` +
+        ? `Hunt complete — no findings returned${filterNote}.${stamp}`
+        : `Hunt complete — <b>${state.findings.length}</b> finding${state.findings.length > 1 ? 's' : ''}${totalNote}${filterNote}${stamp}` +
           (state.autoRefreshOn ? ' · <span class="feed-stamp"><span class="live-dot"></span>auto-refresh on</span>' : '');
   } catch (e) {
     el.huntStatus.textContent = 'Hunt failed: ' + e.message;
@@ -480,6 +650,40 @@ async function runHunt({ silent = false } = {}) {
   } finally {
     el.btnRunHunt.disabled = !state.apiUp;
   }
+}
+
+/* method filter options are built ONLY from detection_method values the API
+ * has actually returned (incl. evidence_chain.detection_method) — never invented,
+ * so a value is always valid to send. */
+function populateMethodOptions(raw) {
+  if (!el.huntMethod) return;
+  const seen = new Set();
+  for (const x of raw) {
+    const m = findingMethod(x);
+    if (m && !seen.has(m)) {
+      seen.add(m);
+      const o = document.createElement('option');
+      o.value = m;
+      o.textContent = 'method: ' + (m.length > 26 ? m.slice(0, 25) + '…' : m);
+      el.huntMethod.appendChild(o);
+    }
+  }
+  if (seen.size > 0) el.huntMethod.disabled = false;
+}
+
+function renderPageBar() {
+  const f = state.hunt;
+  const total = f.total;
+  const show = total !== null && total > f.limit;
+  if (el.pageBar) el.pageBar.hidden = !show;
+  if (!show) return;
+  const from = total === 0 ? 0 : f.offset + 1;
+  const to = Math.min(total, f.offset + f.limit);
+  const page = Math.floor(f.offset / f.limit) + 1;
+  const pages = Math.max(1, Math.ceil(total / f.limit));
+  el.pageInfo.textContent = `${from}–${to} of ${total} · page ${page}/${pages}`;
+  el.btnPrevPage.disabled = f.offset <= 0;
+  el.btnNextPage.disabled = f.offset + f.limit >= total;
 }
 
 function renderHuntSkeletons() {
@@ -492,12 +696,20 @@ function renderHuntSkeletons() {
   }
 }
 
+/* detection_method lives in evidence_chain on the real backend — read both
+ * shapes so the method filter options and client-side filtering stay truthful. */
+function findingMethod(x) {
+  const chain = (x && (x.evidence_chain ?? x.evidenceChain)) || {};
+  return String(x.detection_method ?? x.method ?? chain.detection_method ?? '').trim();
+}
+
 function normalizeFinding(f) {
   const ev = f.evidence ?? f.evidence_strings ?? f.details ?? [];
   const nodes = f.nodes ?? f.involved_nodes ?? f.node_ids ?? f.entities ?? [];
   return {
     title: String(f.title ?? f.name ?? ''),
     severity: String(f.severity ?? f.level ?? 'info'),
+    method: findingMethod(f),
     evidence: (Array.isArray(ev) ? ev : [ev]).map(String).filter(Boolean),
     nodes: (Array.isArray(nodes) ? nodes : [nodes])
       .map((n) => String((n && typeof n === 'object' ? nodeIdOf(n) : n) ?? ''))
@@ -530,7 +742,7 @@ function renderFindings() {
     el.findingsList.appendChild(card);
   }
   el.findingsList.querySelectorAll('.node-chip').forEach((b) =>
-    b.addEventListener('click', (ev) => { ev.stopPropagation(); runBlastRadius(b.dataset.node); }));
+    b.addEventListener('click', (ev) => { ev.stopPropagation(); handleNodeClick(b.dataset.node); }));
   // click the title to open the evidence-chain drawer
   [...el.findingsList.children].forEach((card, i) => {
     const t = card.querySelector('.finding-title');
@@ -588,11 +800,19 @@ async function runBlastRadius(nodeId) {
           ? Object.entries(rawBr).map(([id, v]) => ({ id, ...((v && typeof v === 'object') ? v : {}) }))
           : []);
     const rows = list
-      .map((r) => ({
-        id: String(r.id ?? r.node_id ?? nodeIdOf(r) ?? ''),
-        distance: r.distance ?? r.hops ?? r.depth ?? '—',
-        risk: r.risk ?? r.score ?? r.risk_score ?? null,
-      }))
+      .map((r) => {
+        const id = String(r.id ?? r.node_id ?? nodeIdOf(r) ?? '');
+        const node = state.nodeById.get(id);
+        // contract: rows may carry data_classification + regulated_reachable (all optional)
+        const dc = String(r.data_classification ?? r.classification ?? node?.dc ?? '').toLowerCase() || '';
+        return {
+          id,
+          distance: r.distance ?? r.hops ?? r.depth ?? '—',
+          risk: r.risk ?? r.score ?? r.risk_score ?? null,
+          dc,
+          regulatedReachable: r.regulated_reachable === true || r.regulatedReachable === true,
+        };
+      })
       .filter((r) => r.id)
       .sort((a, b) => (Number(a.distance) || 0) - (Number(b.distance) || 0));
     const rawActions = data.actions ?? data.recommendations ?? [];
@@ -615,12 +835,25 @@ async function runBlastRadius(nodeId) {
       }
     }
 
-    state.blast = { sourceId: nodeId, rows, actions, exfilCount: state.exfilSet.size };
+    state.blast = {
+      sourceId: nodeId, rows, actions, exfilCount: state.exfilSet.size,
+      // contract: /blast-radius gains regulated_datasets + notification_scope (all optional)
+      regulatedDatasets: data.regulated_datasets ?? data.regulatedDatasets ?? null,
+      notificationScope: data.notification_scope ?? data.notificationScope ?? null,
+    };
     state.blastSet = new Set(rows.map((r) => r.id));
+    // regulated-data overlay: crimson halo on nodes holding regulated data
+    state.dpdpRegulatedSet = new Set(
+      rows.filter((r) => r.dc === 'regulated' || r.regulatedReachable).map((r) => r.id));
     await loadDecisions(); // merge persisted analyst audit state into the queue
     renderBlast();
+    renderDpdp();
+    if (window.Graph3D && typeof window.Graph3D.setRegulated === 'function') {
+      window.Graph3D.setRegulated(state.dpdpRegulatedSet);
+    }
+    if (el.btnBlastTour) el.btnBlastTour.hidden = false;
     ensurePulse();
-    toast(`Blast radius: ${rows.length} nodes · ${state.exfilSet.size} exfil-risk · ${actions.length} actions awaiting approval`, 'ok');
+    toast(`Blast radius: ${rows.length} nodes · ${state.exfilSet.size} exfil-risk · ${state.dpdpRegulatedSet.size} regulated · ${actions.length} actions awaiting approval`, 'ok');
     if (window.Graph3D && typeof window.Graph3D.flyTo === 'function') window.Graph3D.flyTo(nodeId);
   } catch (e) {
     el.blastSource.textContent = 'blast-radius failed: ' + e.message;
@@ -656,13 +889,38 @@ async function loadDecisions() {
       const a = r.action ?? r.action_name ?? '', t = r.target ?? r.node_id ?? '';
       if (a && r.decision) state.decisions.set(actionKey(a, t), String(r.decision));
     }
+    // contract: GET /decisions.persisted === true means the Supabase store is
+    // configured (decisions survive restarts); false/undefined = in-memory only
+    state.persisted = d.persisted === true;
+    state.queuePersisted = d.queue_persisted === true;
   } catch (e) { /* decisions history optional — queue still works */ }
+}
+
+/* Honest persistence badge for the containment queue, driven ONLY by the
+ * GET /decisions contract — never inferred, never invented. */
+function queuePersistLine() {
+  if (state.persisted === null) {
+    return '<div class="persist-line muted small">decision audit: persistence state unknown — ' +
+      '<code>GET /decisions</code> unreachable</div>';
+  }
+  return state.persisted
+    ? '<div class="persist-line"><span class="persist-badge ok">⛁ persisted → Supabase</span>' +
+      '<span class="muted small">decisions survive restarts</span></div>'
+    : '<div class="persist-line"><span class="persist-badge warn">⚠ in-memory only</span>' +
+      '<span class="muted small">Supabase store not configured — decisions are lost on restart</span></div>';
+}
+
+/* Explicit pre-blast empty state for the containment queue (no invented actions). */
+function renderQueueEmpty() {
+  el.actionsList.innerHTML =
+    '<p class="empty">No blast radius computed yet — the containment queue appears here. ' +
+    'Nothing to approve, nothing auto-executes.</p>';
 }
 
 async function decideAction(nodeId, action, target, decision, btn) {
   if (btn) btn.disabled = true;
   try {
-    await apiFetch(EP_DECISIONS, {
+    const res = await apiFetch(EP_DECISIONS, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -672,8 +930,12 @@ async function decideAction(nodeId, action, target, decision, btn) {
         rationale: `analyst ${decision} via dashboard (recommended action, reversible — human gate held)`,
       }),
     });
+    // contract: POST /decisions.stored === true means the audit record is durable
+    const stored = res && res.stored === true;
     state.decisions.set(actionKey(action, target), decision);
-    toast(`${decision === 'approved' ? '✓ approved' : '✕ rejected'}: ${action} → ${target}`, decision === 'approved' ? 'ok' : 'warn');
+    const verdict = decision === 'approved' ? '✓ approved' : '✕ rejected';
+    if (stored) toast(`${verdict}: ${action} → ${target}`, decision === 'approved' ? 'ok' : 'warn');
+    else toast(`${verdict}: ${action} → ${target} — recorded IN-MEMORY ONLY (Supabase not configured)`, 'warn');
     renderBlastActions(); // refresh row to show the audit badge
   } catch (e) {
     toast('Decision failed: ' + e.message, 'err');
@@ -683,8 +945,8 @@ async function decideAction(nodeId, action, target, decision, btn) {
 
 function renderBlastActions() {
   const b = state.blast;
-  if (!b) return;
-  el.actionsList.innerHTML = b.actions.length
+  if (!b) { renderQueueEmpty(); return; }
+  el.actionsList.innerHTML = queuePersistLine() + (b.actions.length
     ? b.actions.map((a) => {
         const key = actionKey(a.text, a.target);
         const decided = state.decisions.get(key);
@@ -708,7 +970,7 @@ function renderBlastActions() {
           </div>
         </div>`;
       }).join('')
-    : '<p class="muted small">no containment actions returned</p>';
+    : '<p class="muted small">no containment actions returned</p>');
   el.actionsList.querySelectorAll('.btn.decide').forEach((btn) => {
     btn.addEventListener('click', () => {
       const k = btn.dataset.k.split('|');
@@ -719,14 +981,18 @@ function renderBlastActions() {
 
 function renderBlast() {
   const b = state.blast;
-  el.blastSource.textContent = `source: ${b.sourceId} · ${b.rows.length} nodes in radius · ${b.exfilCount} exfil-risk`;
+  el.blastSource.textContent =
+    `source: ${b.sourceId} · ${b.rows.length} nodes in radius · ${b.exfilCount} exfil-risk · ${state.dpdpRegulatedSet.size} regulated`;
   el.blastRows.innerHTML = b.rows.length
     ? b.rows.map((r) => {
         const width = r.risk === null ? 0 : Math.min(100, Math.max(4, Number(r.risk) <= 1 ? Number(r.risk) * 100 : Number(r.risk)));
         const node = state.nodeById.get(r.id);
         const isExfil = r.exfil === true;
+        const dc = ['public', 'internal', 'confidential', 'regulated'].includes(r.dc)
+          ? `<span class="dc dc-${r.dc}" title="data classification: ${esc(r.dc)}">${esc(r.dc)}</span>`
+          : '';
         return `<tr class="${isExfil ? 'blast-row-exfil' : ''}">
-          <td>${esc(r.id)}${String(r.id) === String(b.sourceId) ? ' ◀' : ''}${isExfil ? '<span class="exfil-tag">EXFIL RISK</span>' : ''}</td>
+          <td>${esc(r.id)}${String(r.id) === String(b.sourceId) ? ' ◀' : ''}${isExfil ? '<span class="exfil-tag">EXFIL RISK</span>' : ''}${dc}</td>
           <td class="${Number(r.distance) === 0 ? 'dist-0' : ''}">${esc(r.distance)}</td>
           <td><span class="risk-bar" style="width:${width}px"></span>${fmtRisk(r.risk)}</td>
         </tr>`;
@@ -745,6 +1011,329 @@ function renderBlast() {
     window.Graph3D.setBlast(state.blastSet, riskById);
     if (window.Graph3D.setExfil) window.Graph3D.setExfil(state.exfilSet);
   }
+}
+
+/* ================= DPDP regulated-data overlay =================
+ * Contract: GET /blast-radius gains:
+ *   regulated_datasets: [{dataset_id,name,classification,nodes_exposed,records_exposed_est}]
+ *   notification_scope: {dpdp_72h_required, affected_individuals_est, datasets}
+ * All optional. Missing fields → explicit "not available in this build" note, never invented.
+ */
+function renderDpdp() {
+  const b = state.blast;
+  const card = el.dpdpCard;
+  if (!card) return;
+  card.hidden = false;
+  const ds = Array.isArray(b.regulatedDatasets) ? b.regulatedDatasets : null;
+  const ns = (b.notificationScope && typeof b.notificationScope === 'object') ? b.notificationScope : null;
+  const anyRegulated = state.dpdpRegulatedSet.size > 0;
+
+  if (ds || ns) {
+    const datasetsHtml = ds && ds.length
+      ? `<div class="dpdp-datasets">${ds.map((d) => {
+          const name = d.name ?? d.dataset_id ?? 'dataset';
+          const cls = String(d.classification ?? 'regulated').toLowerCase();
+          return `<div class="dpdp-dataset">
+            <span class="ds-name">${esc(name)}</span>
+            <span class="dc dc-${['public', 'internal', 'confidential', 'regulated'].includes(cls) ? cls : 'regulated'}">${esc(d.classification ?? 'regulated')}</span>
+            <span class="ds-stats">${fmtCount(d.nodes_exposed ?? d.nodesExposed)} nodes · ${fmtCount(d.records_exposed_est ?? d.recordsExposedEst)} records est.</span>
+          </div>`;
+        }).join('')}</div>`
+      : '<p class="muted small">regulated_datasets returned empty by the API.</p>';
+    const notify72 = ns ? ns.dpdp_72h_required === true : null;
+    const affected = ns ? ns.affected_individuals_est ?? ns.affectedIndividualsEst : null;
+    card.innerHTML = `
+      <div class="dpdp-head"><span class="dpdp-kicker">DPDP Act 2023 · regulated-data exposure</span></div>
+      ${notify72 === true
+        ? '<p class="dpdp-notice"><b>72h breach notification required</b> — compromised blast radius reaches regulated personal data. Notify the Data Protection Board of India within 72 hours; notify affected individuals as prescribed.</p>'
+        : notify72 === false
+          ? '<p class="dpdp-notice calm"><b>No 72h notification obligation flagged</b> by the API for this blast radius.</p>'
+          : ''}
+      <div class="dpdp-metrics">
+        <div><span class="sm-num">${anyRegulated ? state.dpdpRegulatedSet.size : '—'}</span><span class="sm-label">regulated nodes in radius</span></div>
+        <div><span class="sm-num">${affected !== null && affected !== undefined ? Number(affected).toLocaleString() : '—'}</span><span class="sm-label">affected individuals (est.)</span></div>
+      </div>
+      ${datasetsHtml}
+      <p class="muted small dpdp-foot">Estimates come from the API — verify before any regulatory filing. Containment remains a human decision; nothing auto-executes.</p>`;
+    const g = window.gsap;
+    if (g) g.from(card, { opacity: 0, y: 8, duration: 0.45, ease: 'power2.out' });
+  } else if (anyRegulated) {
+    // real regulated nodes, but this backend build publishes no notification-scope fields
+    card.innerHTML = `
+      <div class="dpdp-head"><span class="dpdp-kicker">DPDP Act 2023 · regulated-data exposure</span></div>
+      <p class="dpdp-na">${state.dpdpRegulatedSet.size} node${state.dpdpRegulatedSet.size > 1 ? 's' : ''} in this blast radius hold <b>regulated</b> data, but <b>notification-scope fields are not available in this backend build</b> — the 72h obligation cannot be confirmed from the API.</p>`;
+  } else {
+    card.innerHTML = `
+      <div class="dpdp-head"><span class="dpdp-kicker">DPDP Act 2023 · regulated-data exposure</span></div>
+      <p class="dpdp-na">Regulated-data overlay <b>not available in this backend build</b> — no <code>regulated_datasets</code> / <code>notification_scope</code> in the <code>/blast-radius</code> response.</p>`;
+  }
+}
+
+function fmtCount(v) {
+  if (v === null || v === undefined || v === '') return '—';
+  const n = Number(v);
+  return Number.isFinite(n) ? n.toLocaleString() : esc(v);
+}
+
+function flashDpdp() {
+  const card = el.dpdpCard;
+  if (!card || card.hidden) return;
+  if (card.scrollIntoView) card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  const g = window.gsap;
+  if (g) {
+    g.fromTo(card,
+      { boxShadow: '0 0 0 rgba(255,45,85,0)' },
+      { boxShadow: '0 0 28px rgba(255,45,85,0.55)', duration: 0.4, yoyo: true, repeat: 1, ease: 'power2.inOut' });
+  }
+}
+
+/* click a regulated node (2D or 3D) → compute blast radius, then jump to its DPDP card */
+async function handleNodeClick(id) {
+  await runBlastRadius(id);
+  if (state.dpdpRegulatedSet && state.dpdpRegulatedSet.has(id)) flashDpdp();
+}
+
+/* camera tour through the blast-radius path (3D); switches to 3D first if needed */
+function tourBlastView() {
+  if (!state.blast || !state.blast.rows.length) { toast('Compute a blast radius first', 'warn'); return; }
+  const w3 = window.Graph3D;
+  if (!w3 || typeof w3.tourBlast !== 'function') { toast('3D view unavailable — tour needs WebGL', 'warn'); return; }
+  if (window.UI && window.UI.getMode() !== '3d') {
+    const ok = window.UI.setView('3d');
+    if (ok === false) { toast('3D view unavailable — tour needs WebGL', 'warn'); return; }
+    setTimeout(() => w3.tourBlast(state.blast.rows), 600); // let 3D settle after view switch
+  } else {
+    w3.tourBlast(state.blast.rows);
+  }
+  toast(`Touring ${Math.min(10, state.blast.rows.length)} blast-radius nodes`, 'info');
+}
+
+/* ================= red-team replay (dual contract) =================
+ * NEW contract (backend ships it today): GET /redteam/scenarios ->
+ *   POST /redteam/run/{id} -> {detected,mttd,mttc,false_positives,blast_radius_precision}
+ * LEGACY contract: GET /demo-scenarios -> POST /demo-scenarios/{id}/run
+ * The UI probes the new contract first and falls back to legacy; only when
+ * BOTH 404/405 does it render the explicit "not available in this build" state.
+ * Zero hardcoded scenarios — every card and metric comes from the API.
+ */
+function scenarioRunUrl(id) {
+  return state.scenarioContract === 'redteam' ? EP_REDEAM_RUN(id) : EP_DEMO_RUN(id);
+}
+function scenarioContractLabel() {
+  return state.scenarioContract === 'redteam' ? 'GET /redteam/scenarios' : 'GET /demo-scenarios';
+}
+
+function normalizeScenario(s) {
+  // real contract: stages: [{stage, status, detection_delay_s, ...}]
+  // legacy contract: steps: [...]
+  const stageList = Array.isArray(s.stages) ? s.stages : [];
+  return {
+    id: String(s.id ?? ''),
+    name: String(s.name ?? s.id ?? ''),
+    description: String(s.description ?? ''),
+    severity: String(s.severity ?? ''),
+    steps: Array.isArray(s.steps) ? s.steps : stageList,
+    stages: stageList,
+    campaign: String(s.campaign ?? ''),
+  };
+}
+
+async function loadScenarios() {
+  if (!el.scenarioStatus) return;
+  el.scenarioStatus.innerHTML =
+    'Probing <code>GET /redteam/scenarios</code> → fallback <code>GET /demo-scenarios</code>…';
+  el.scenarioList.innerHTML = '';
+  const attempts = [
+    { name: 'redteam', url: EP_REDEAM_SCENARIOS },
+    { name: 'demo', url: EP_DEMO_SCENARIOS },
+  ];
+  let found = null;
+  for (const a of attempts) {
+    try {
+      const data = await apiFetch(a.url);
+      const raw = Array.isArray(data) ? data : (data.scenarios ?? data.items ?? null);
+      if (Array.isArray(raw)) { found = { name: a.name, list: raw }; break; }
+    } catch (e) {
+      if (/HTTP 404|HTTP 405/.test(e.message)) continue; // contract absent — try next
+      // real error (500/network): surface it, never mask as "unsupported"
+      state.scenarioContract = null;
+      state.scenariosState = 'unsupported';
+      el.scenarioStatus.innerHTML =
+        `Red-team replay <b>error</b> on <code>${esc(a.url)}</code>: ${esc(e.message)}`;
+      return;
+    }
+  }
+  if (!found) {
+    state.scenarioContract = null;
+    state.scenariosState = 'unsupported';
+    el.scenarioStatus.innerHTML =
+      'Red-team replay <b>not available in this backend build</b> — neither ' +
+      '<code>GET /redteam/scenarios</code> nor <code>GET /demo-scenarios</code> exists. ' +
+      'Deploy a newer backend, then press <b>↻ retry</b> in the banner above.';
+    return;
+  }
+  state.scenarioContract = found.name;
+  state.scenarios = found.list.map(normalizeScenario).filter((s) => s.id);
+  state.scenariosState = 'ready';
+  renderScenarios();
+}
+
+function renderScenarios() {
+  if (state.scenariosState !== 'ready') return;
+  el.scenarioStatus.innerHTML = state.scenarios.length
+    ? `${state.scenarios.length} scripted scenario${state.scenarios.length > 1 ? 's' : ''} — one-click replay against the graph. ` +
+      `<span class="contract-src">contract: <code>${esc(scenarioContractLabel())}</code></span> · all metrics measured live by the API.`
+    : `The API returned no scenarios (<code>${esc(scenarioContractLabel())}</code>).`;
+  const stepWord = state.scenarioContract === 'redteam' ? 'stages' : 'steps';
+  el.scenarioList.innerHTML = state.scenarios.map((s) =>
+    `<div class="scenario">
+       <div class="scenario-top"><b>${esc(s.name)}</b><span class="sev ${sevClass(s.severity)}">${esc(s.severity || 'n/a')}</span></div>
+       ${s.description ? `<p class="muted small">${esc(s.description)}</p>` : ''}
+       <div class="scenario-foot">
+         <span class="muted small">${s.steps.length} ${stepWord}${s.campaign ? ` · <code>${esc(s.campaign)}</code>` : ''}</span>
+         <button class="btn accent sm" data-run="${esc(s.id)}">▶ Run</button>
+       </div>
+     </div>`).join('');
+  el.scenarioList.querySelectorAll('[data-run]').forEach((btn) =>
+    btn.addEventListener('click', () => runScenario(btn.dataset.run)));
+  const g = window.gsap;
+  if (g && state.scenarios.length) {
+    g.from('#scenarioList .scenario',
+      { x: -14, opacity: 0, duration: 0.4, stagger: 0.08, ease: 'power2.out', overwrite: true });
+  }
+}
+
+async function runScenario(id) {
+  const s = state.scenarios.find((x) => x.id === id);
+  el.scenarioResult.hidden = false;
+  el.scenarioResult.innerHTML =
+    `<p class="muted small">running scenario <code>${esc(id)}</code>… ` +
+    `(<code>POST ${esc(scenarioRunUrl(id).replace(API_BASE, ''))}</code>)</p>`;
+  try {
+    let r;
+    try {
+      r = await apiFetch(scenarioRunUrl(id), { method: 'POST' });
+    } catch (e) {
+      if (/HTTP 404|HTTP 405/.test(e.message)) {
+        // cross-contract fallback: the run endpoint may live under the other contract
+        state.scenarioContract = state.scenarioContract === 'redteam' ? 'demo' : 'redteam';
+        r = await apiFetch(scenarioRunUrl(id), { method: 'POST' });
+      } else throw e;
+    }
+    renderScenarioResult(s, r);
+  } catch (e) {
+    el.scenarioResult.innerHTML = `<p class="err-text">Scenario run failed: ${esc(e.message)}</p>`;
+  }
+}
+
+function fmtMetric(v, suffix) {
+  if (v === null || v === undefined || v === '') return '—';
+  const n = Number(v);
+  if (!Number.isFinite(n)) return esc(v);
+  return n.toLocaleString(undefined, { maximumFractionDigits: 2 }) + (suffix || '');
+}
+
+/* Scenario-result normalization — two real contracts, one card.
+ * Legacy (/demo-scenarios/{id}/run): {detected: bool, mttd_seconds, mttc_seconds,
+ *   false_positives, blast_radius_precision (percent)}
+ * New (/redteam/run/{id}): {detected: <count>, missed: <count>, coverage: "5/7",
+ *   mttd_seconds, mttc_seconds, blast_radius: {precision: <fraction>, ...},
+ *   stages: [{stage, status: detected|missed, detection_delay_s}], detections_fired_total}
+ * Every number on screen comes from the API response — nothing invented.
+ */
+function renderScenarioResult(s, r) {
+  const stages = Array.isArray(r.stages) ? r.stages : [];
+  const missed = typeof r.missed === 'number' ? r.missed : null;
+  const detectedCount = typeof r.detected === 'number' ? r.detected
+    : (stages.length
+        ? stages.filter((st) => String(st.status || '').toLowerCase() === 'detected').length
+        : (r.detected === true ? 1 : 0));
+  const totalStages = stages.length || (missed !== null ? detectedCount + missed : null);
+  const coverage = r.coverage ?? (totalStages ? `${detectedCount}/${totalStages}` : null);
+  const detected = detectedCount > 0 || r.detected === true;
+  const mttd = r.mttd_seconds ?? r.mttd ?? null;
+  const mttc = r.mttc_seconds ?? r.mttc ?? r.analyst_response_sla_seconds ?? null;
+  const fp = r.false_positives ?? r.falsePositives ?? r.fp ?? null;
+  const fired = r.detections_fired_total ?? r.detectionsFiredTotal ?? null;
+  let prec = r.blast_radius_precision ?? r.blast_precision ?? r.precision ??
+    ((r.blast_radius && typeof r.blast_radius === 'object') ? r.blast_radius.precision : null) ?? null;
+  // new contract reports precision as a fraction (0.024) — legacy as percent (91.7)
+  if (prec !== null && prec !== undefined && prec !== '' && Number.isFinite(Number(prec))) {
+    const pn = Number(prec);
+    prec = (pn > 0 && pn <= 1) ? pn * 100 : pn;
+  }
+  const verdict = detected
+    ? (coverage ? `✓ DETECTED ${coverage} stages` : '✓ DETECTED')
+    : '✕ NOT DETECTED';
+  state.lastScenarioRun = {
+    name: s ? s.name : '', id: s ? s.id : '',
+    detected, coverage, mttd, mttc, fp, fired, prec,
+  };
+  const timeline = stages.length
+    ? `<div class="stage-timeline" aria-label="attack stage timeline">` + stages.map((st) => {
+        const ok = String(st.status || '').toLowerCase() === 'detected';
+        const delay = st.detection_delay_s ?? st.delay_s;
+        return `<div class="stage ${ok ? 'hit' : 'miss'}" title="${esc(String(st.status || ''))}">` +
+          `<span class="stage-dot"></span>` +
+          `<span class="stage-name">${esc(st.stage ?? st.name ?? '')}</span>` +
+          `<span class="stage-delay">${ok && delay !== null && delay !== undefined ? esc(delay) + 's' : '—'}</span>` +
+          `</div>`;
+      }).join('') + `</div>`
+    : '';
+  el.scenarioResult.innerHTML = `
+    <div class="scenario-res-top">
+      <span class="det ${detected ? 'yes' : 'no'}">${esc(verdict)}</span>
+      <b>${esc(s ? s.name : '')}</b>
+    </div>
+    <div class="scenario-metrics">
+      <div><span class="sm-num">${fmtMetric(mttd)}</span><span class="sm-label">MTTD (s)</span></div>
+      <div><span class="sm-num">${fmtMetric(mttc)}</span><span class="sm-label">MTTC (s)</span></div>
+      <div><span class="sm-num">${fp !== null ? fmtMetric(fp) : (fired !== null ? fmtMetric(fired) : '—')}</span><span class="sm-label">${fp !== null ? 'false positives' : 'detections fired'}</span></div>
+      <div><span class="sm-num">${fmtMetric(prec, '%')}</span><span class="sm-label">blast precision</span></div>
+    </div>
+    ${timeline}
+    <div class="scenario-res-foot">
+      <button class="btn ghost sm" id="btnCopyDemoScript">⧉ copy demo script</button>
+      <span class="muted small">measured by the API, not scripted · <span class="contract-src"><code>${esc('POST ' + scenarioRunUrl(s ? s.id : '').replace(API_BASE, ''))}</code></span></span>
+    </div>`;
+  const cb = document.getElementById('btnCopyDemoScript');
+  if (cb) cb.addEventListener('click', copyDemoScript);
+  // animated results card: verdict pops, metric cells + stage chips cascade in
+  const g = window.gsap;
+  if (g) {
+    const det = el.scenarioResult.querySelector('.det');
+    if (det) g.from(det, { scale: 0.55, opacity: 0, duration: 0.38, ease: 'back.out(2.4)', overwrite: true });
+    const cells = el.scenarioResult.querySelectorAll('.scenario-metrics > div, .stage-timeline .stage');
+    if (cells.length) {
+      g.from(cells, { y: 12, opacity: 0, duration: 0.35, stagger: 0.06, ease: 'power2.out', delay: 0.12, overwrite: true });
+    }
+  }
+}
+
+/* judge-friendly narration — every number is a real measured value from the run above */
+function copyDemoScript() {
+  const r = state.lastScenarioRun;
+  if (!r) return;
+  const verdict = r.detected
+    ? (r.coverage ? `detected ${r.coverage} of the attack stages` : 'detected the campaign')
+    : 'did NOT detect the campaign';
+  const mttd = r.mttd !== null && r.mttd !== undefined ? r.mttd + 's' : 'n/a';
+  const mttc = r.mttc !== null && r.mttc !== undefined ? r.mttc + 's' : 'n/a';
+  const fp = r.fp !== null && r.fp !== undefined ? 'false positives ' + r.fp
+    : (r.fired !== null && r.fired !== undefined ? 'detections fired ' + r.fired : 'n/a');
+  const prec = r.prec !== null && r.prec !== undefined ? r.prec + '%' : 'n/a';
+  const text =
+`GraphOps red-team replay — "${r.name}"
+We replayed a scripted attack campaign against the SOC graph and GraphOps ${verdict}.
+Measured live: MTTD ${mttd} · MTTC ${mttc} · ${fp} · blast-radius precision ${prec}.
+Containment stays human-gated: every action is a recommendation awaiting analyst approval — nothing auto-executes.`;
+  if (!navigator.clipboard || !navigator.clipboard.writeText) {
+    toast('Clipboard unavailable in this browser context', 'err');
+    return;
+  }
+  navigator.clipboard.writeText(text)
+    .then(() => toast('Demo script copied — paste it into the judge walkthrough', 'ok'))
+    .catch((e) => toast('Copy failed: ' + (e && e.message ? e.message : e), 'err'));
 }
 
 /* ================= evidence-chain drawer ================= */
@@ -816,7 +1405,7 @@ function openDrawer(finding) {
       </div>
     </div>`;
   el.drawerBody.querySelectorAll('.path-node').forEach((btn) =>
-    btn.addEventListener('click', () => runBlastRadius(btn.dataset.node)));
+    btn.addEventListener('click', () => handleNodeClick(btn.dataset.node)));
   const hb = el.drawerBody.querySelector('#drawerHighlight');
   if (hb) hb.addEventListener('click', () => {
     const ids = new Set(path.length ? path.map((p) => p.id) : uniq);
@@ -826,7 +1415,7 @@ function openDrawer(finding) {
     toast(`Highlighted ${ids.size} nodes from the evidence chain`, 'ok');
   });
   const db = el.drawerBody.querySelector('#drawerBlast');
-  if (db && uniq[0]) db.addEventListener('click', () => { closeDrawer(); runBlastRadius(uniq[0]); });
+  if (db && uniq[0]) db.addEventListener('click', () => { closeDrawer(); handleNodeClick(uniq[0]); });
   el.drawer.hidden = false;
   const g = window.gsap;
   if (g) g.fromTo('.drawer', { x: 430, opacity: 0.6 }, { x: 0, opacity: 1, duration: 0.42, ease: 'power3.out' });
@@ -845,26 +1434,31 @@ function closeDrawer() {
 function pushGraphTo3D() {
   if (!window.Graph3D || state.nodes.length === 0) return;
   window.Graph3D.setData(
-    state.nodes.map((n) => ({ id: n.id, etype: n.etype, label: n.label, degree: n.degree })),
+    state.nodes.map((n) => ({ id: n.id, etype: n.etype, label: n.label, degree: n.degree, dc: n.dc })),
     state.edges.map((e) => ({ a: e.source.id, b: e.target.id, etype: e.etype }))
   );
-  window.Graph3D.onNodeClick = (id) => runBlastRadius(id);
+  window.Graph3D.onNodeClick = (id) => handleNodeClick(id);
   window.Graph3D._wired = true;
   if (window.Graph3D.setExfil) window.Graph3D.setExfil(state.exfilSet);
+  if (window.Graph3D.setRegulated) window.Graph3D.setRegulated(state.dpdpRegulatedSet);
 }
 
 function clearHighlights() {
   state.attackPath = new Set();
   state.blastSet = new Set();
   state.exfilSet = new Set();
+  state.dpdpRegulatedSet = new Set();
   state.blast = null;
   el.blastResults.hidden = true;
   el.blastEmpty.hidden = false;
   el.blastSource.textContent = '';
+  if (el.dpdpCard) el.dpdpCard.hidden = true;
+  if (el.btnBlastTour) el.btnBlastTour.hidden = true;
   if (window.Graph3D) {
     window.Graph3D.setAttackPath(new Set());
     window.Graph3D.setBlast(new Set(), []);
     if (window.Graph3D.setExfil) window.Graph3D.setExfil(new Set());
+    if (window.Graph3D.setRegulated) window.Graph3D.setRegulated(new Set());
   }
   const sb = document.getElementById('statBlast');
   if (sb && window.UI) UI.countUp(sb, 0, { dur: 0.5 });
@@ -888,17 +1482,29 @@ function focusFinding(i) {
 function exposeBridge() {
   window.GraphOps = {
     getGraphData: () => ({
-      nodes: state.nodes.map((n) => ({ id: n.id, etype: n.etype, label: n.label, degree: n.degree })),
+      nodes: state.nodes.map((n) => ({ id: n.id, etype: n.etype, label: n.label, degree: n.degree, dc: n.dc })),
       edges: state.edges.map((e) => ({ a: e.source.id, b: e.target.id, etype: e.etype })),
     }),
     getBlast: () => (state.blast
       ? { set: state.blastSet, risk: state.blast.rows.map((r) => [r.id, r.risk]), exfil: state.exfilSet }
       : null),
+    getDpdp: () => (state.blast
+      ? { regulated: state.blast.regulatedDatasets, notificationScope: state.blast.notificationScope,
+          regulatedNodes: [...state.dpdpRegulatedSet] }
+      : null),
+    getScenarios: () => state.scenarios,
+    runScenario,
+    getScenarioContract: () => state.scenarioContract,
+    getPersisted: () => state.persisted,
+    toggleColorMode, getColorMode: () => state.colorMode,
+    tourBlastView,
+    retryConnection,
     getAttackPath: () => state.attackPath,
     getFindings: () => state.findings,
     runHunt: (opts) => runHunt(opts || {}),
     runDemo: runDemoScenario,
     runBlast: runBlastRadius,
+    clickNode: handleNodeClick, // blast radius + DPDP jump for regulated nodes
     clearHighlights,
     focusFinding,
     redraw2d: () => draw(),
@@ -910,7 +1516,7 @@ function exposeBridge() {
     openDrawerForFinding: (i) => openDrawer(state.findings[i]),
   };
   if (window.Graph3D) {
-    window.Graph3D.onNodeClick = (id) => runBlastRadius(id);
+    window.Graph3D.onNodeClick = (id) => handleNodeClick(id);
     window.Graph3D._wired = true;
   }
 }
