@@ -25,7 +25,7 @@ Rule: every feature listed as DONE must be verified working end-to-end. Blocked 
 
 **QA:** 21 new tests `tests/test_qa_1007.py` (blast-radius boundaries, hunt limits, /contain 422s, evidence-chain completeness, gate invariants ≥0.90, neo4j fallback); suite **160/160 green**; coordinator re-ran full smoke (TestClient): `/` 200, `/api/health` 200, `POST /api/hunt` 200, `POST /api/blast-radius` 200, `/api/decisions` 200, `/contain` isolate_host → queued_for_approval/executed=False/store=local, `/redteam/run/oauth-scope-creep-exfil` → MTTD 0.0. Security review all PASS (no hardcoded secrets, no exec in containment, no error leakage, .gitignore clean).
 
-**Deploy:** (pending — tokens present: GITHUB_TOKEN + VERCEL_TOKEN).
+**Deploy:** Vercel production deployment `graphops-ijhn208jj-shivam8668bakal-7211.vercel.app` (dpl_AX6tyZrbatsVydVJGgyZpTecxvV6) → **READY** (file-based API, 66 files, today's verified tree). ⚠️ BLOCKER: GitHub push FAILED — GITHUB_TOKEN in deploy.env returns 401 (invalid/expired); worked yesterday, rejected today. Commit `c50a0c5` stays local-only until he refreshes the token (his PAT flow). Vercel deployment is the live demo of today's build, but the repo on GitHub lags behind. ⚠️ SSO wall persists: project's `ssoProtection` (`all_except_custom_domains`) 302s anonymous `/api/health` to vercel.com/sso-api — needs his call (disable SSO protection / custom domain / bypass secret).
 
 **Next up:** wire new endpoints into dashboard fully; PPT draft; video plan; 2 more demo measurements.
 
