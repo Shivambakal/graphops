@@ -196,3 +196,87 @@ def list_queued(limit: int = 100) -> List[Dict[str, Any]]:
     records = _local_read()
     records.sort(key=lambda r: str(r.get("created_at", "")), reverse=True)
     return records[: max(int(limit), 1)]
+
+
+# ---------------------------------------------------------------------------
+# Analyst decisions: Supabase when configured, else local gitignored JSON.
+# ---------------------------------------------------------------------------
+
+def _decisions_path() -> Path:
+    override = os.environ.get("GRAPHOPS_DECISIONS_PATH", "").strip()
+    if override:
+        return Path(override)
+    return _BUILD_DIR / ".containment-decisions.json"
+
+
+def _decisions_local_read() -> List[Dict[str, Any]]:
+    try:
+        with open(_decisions_path()) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def _decisions_local_append(record: Dict[str, Any]) -> None:
+    records = _decisions_local_read()
+    records.append(record)
+    try:
+        p = _decisions_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        with open(tmp, "w") as f:
+            json.dump(records, f, indent=2)
+        tmp.replace(p)
+    except OSError:
+        pass
+
+
+def record_analyst_decision(node_id: str, action: str, target: str = "",
+                            decision: str = "", rationale: str = "",
+                            decided_by: str = "analyst"
+                            ) -> Tuple[Dict[str, Any], str]:
+    """Persist an analyst approve/reject decision on a containment action.
+
+    Returns (record, store) where store is "supabase" or "local".
+    Supabase is tried first; when it is unconfigured or unreachable the
+    decision lands in the gitignored local JSON store. The decision is an
+    audit record only — it never triggers execution of anything.
+    """
+    record = {
+        "id": uuid.uuid4().hex,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "node_id": str(node_id),
+        "action": str(action),
+        "target": str(target),
+        "decision": str(decision),
+        "decided_by": str(decided_by),
+        "rationale": str(rationale),
+        "executed": False,  # audit trail only; approving never executes
+    }
+    try:
+        from graphops.store import supabase_client as _store
+        if _store is not None and _store.is_configured():
+            rid = _store.record_decision(
+                record["node_id"], record["action"], record["target"],
+                record["decision"], record["rationale"], record["decided_by"])
+            if rid:
+                record["id"] = rid
+                return record, "supabase"
+    except Exception:
+        pass
+    _decisions_local_append(record)
+    return record, "local"
+
+
+def list_analyst_decisions(limit: int = 50) -> Tuple[List[Dict[str, Any]], str]:
+    """List analyst decisions, newest first. Returns (decisions, store)."""
+    try:
+        from graphops.store import supabase_client as _store
+        if _store is not None and _store.is_configured():
+            return _store.list_decisions(limit=limit), "supabase"
+    except Exception:
+        pass
+    records = _decisions_local_read()
+    records.sort(key=lambda r: str(r.get("created_at", "")), reverse=True)
+    return records[: max(int(limit), 1)], "local"

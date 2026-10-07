@@ -53,6 +53,18 @@ def _demo_engine():
 # ---------------------------------------------------------------------------
 # Normalization helpers (duck-type whatever engine we get)
 # ---------------------------------------------------------------------------
+try:
+    from graphops.graph.classification import classify_node as _classify_node
+except Exception:  # pragma: no cover
+    def _classify_node(_engine, _node_id):  # type: ignore[misc]
+        return "internal"
+
+
+def _node_classification(engine, node_id):
+    try:
+        return _classify_node(engine, node_id)
+    except Exception:
+        return "internal"
 def _normalize_nodes(engine):
     nodes = []
     getter = getattr(engine, "nodes", None)
@@ -67,6 +79,8 @@ def _normalize_nodes(engine):
                     "id": str(n.get("id")),
                     "etype": str(n.get("etype", "unknown")),
                     "label": str(n.get("label", n.get("id"))),
+                    "data_classification": _node_classification(
+                        engine, n.get("id")),
                 })
             elif isinstance(n, (tuple, list)) and len(n) == 2:
                 nid, attrs = n
@@ -76,11 +90,18 @@ def _normalize_nodes(engine):
                         "id": str(nid),
                         "etype": str(attrs.get("etype", "unknown")),
                         "label": str(attrs.get("label", nid)),
+                        "data_classification": _node_classification(
+                            engine, nid),
                     })
                 else:
-                    nodes.append({"id": str(nid), "etype": "unknown", "label": str(nid)})
+                    nodes.append({"id": str(nid), "etype": "unknown",
+                                  "label": str(nid),
+                                  "data_classification": _node_classification(
+                                      engine, nid)})
             else:
-                nodes.append({"id": str(n), "etype": "unknown", "label": str(n)})
+                nodes.append({"id": str(n), "etype": "unknown", "label": str(n),
+                              "data_classification": _node_classification(
+                                  engine, n)})
     # networkx-graph fallback (engine.graph)
     if not nodes:
         g = getattr(engine, "graph", None)
@@ -91,6 +112,7 @@ def _normalize_nodes(engine):
                     "id": str(nid),
                     "etype": str(attrs.get("etype", "unknown")),
                     "label": str(attrs.get("label", nid)),
+                    "data_classification": _node_classification(engine, nid),
                 })
         except Exception:
             pass
@@ -156,7 +178,8 @@ def _fallback_containment(engine, node_id):
     affected = sorted(seen - {node_id})
     return {
         "node_id": node_id,
-        "blast_radius": [{"id": n} for n in affected],
+        "blast_radius": [{"id": n, "data_classification":
+                          _node_classification(engine, n)} for n in affected],
         "blast_radius_size": len(affected),
         "actions": [
             {"action": "isolate_host", "target": node_id, "priority": "P1",
@@ -230,11 +253,41 @@ class BlastRadiusRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "nodes": N_NODES, "edges": N_EDGES, "synthetic": True}
+    diag = {
+        "status": "ok",
+        "nodes": N_NODES,
+        "edges": N_EDGES,
+        "synthetic": True,
+        "engine_source": ENGINE_SOURCE,
+        "ingested": _INGESTED_GRAPH is not None,
+    }
+    # Persistence backend for the containment queue + analyst decisions.
+    supabase_up = _store is not None and _store.is_configured()
+    diag["persistence"] = "supabase" if supabase_up else "local"
+    diag["supabase_configured"] = bool(supabase_up)
+    # Analyst-gate queue depth (guarded; never breaks /health).
+    try:
+        from graphops.response.gate import list_queued as _lq
+        diag["queue_depth"] = len(_lq(limit=1000))
+    except Exception:
+        diag["queue_depth"] = None
+    # Neo4j liveness (short timeout, never raises, never leaks creds).
+    try:
+        from graphops.store import neo4j_client as _neo
+        diag["neo4j"] = _neo.ping(timeout=4.0)
+    except Exception:
+        diag["neo4j"] = {"reachable": False, "latency_ms": None,
+                         "error": "client unavailable"}
+    return diag
+
+
+# Finding caps: a single noisy query must not blow up the payload.
+MAX_FINDINGS_PER_QUERY = 100
+MAX_FINDINGS_TOTAL = 500
 
 
 @app.post("/hunt")
-def hunt():
+def hunt(max_findings: int = MAX_FINDINGS_TOTAL):
     queries = []
     try:
         from graphops.hunt.queries import (
@@ -257,9 +310,11 @@ def hunt():
         try:
             res = fn(engine)
             if res:
-                findings.extend(res if isinstance(res, list) else [res])
+                items = res if isinstance(res, list) else [res]
+                findings.extend(items[:MAX_FINDINGS_PER_QUERY])
         except Exception:
             traceback.print_exc()  # a failing query contributes nothing, never a 500
+    findings = findings[: max(1, min(int(max_findings), 1000))]
     # Every finding ships its evidence chain (signals + subgraph + recommendation).
     try:
         from graphops.hunt.evidence import attach_evidence_chains
@@ -314,6 +369,39 @@ def redteam_replay(req: RedteamRequest):
         raise HTTPException(status_code=500, detail="redteam replay failed")
 
 
+@app.get("/redteam/scenarios")
+def redteam_scenarios():
+    """Catalog of the scripted end-to-end red-team demo scenarios."""
+    try:
+        from graphops.redteam.scenarios import list_scenarios
+        catalog = list_scenarios()
+        return {"scenarios": catalog, "count": len(catalog),
+                "synthetic": True}
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="scenarios unavailable")
+
+
+@app.post("/redteam/run/{scenario_id}")
+def redteam_run_scenario(scenario_id: str, seed: int = 42):
+    """Replay one scripted scenario against the synthetic seeded graph.
+
+    Returns per-stage detection results plus MTTD, MTTC (detection delay +
+    a synthetic analyst-response SLA — containment is recommendations-only
+    and never auto-executes), detections fired per hunt, and blast-radius
+    precision/recall. NO real system access, NO execution of anything.
+    """
+    try:
+        from graphops.redteam.scenarios import run_scenario, get_scenario
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="scenarios unavailable")
+    if get_scenario(scenario_id) is None:
+        raise HTTPException(status_code=404,
+                            detail=f"unknown scenario {scenario_id!r}")
+    return run_scenario(scenario_id, seed=int(seed))
+
+
 @app.post("/blast-radius")
 def blast_radius(req: BlastRadiusRequest):
     if req.node_id not in _NODE_INDEX:
@@ -360,25 +448,26 @@ class DecisionRequest(BaseModel):
 def record_decision(req: DecisionRequest):
     if req.decision not in ("approved", "rejected"):
         raise HTTPException(status_code=400, detail="decision must be 'approved' or 'rejected'")
-    stored_id = None
-    if _store is not None:
-        try:
-            stored_id = _store.record_decision(
-                req.node_id, req.action, req.target, req.decision, req.rationale
-            )
-        except Exception:
-            traceback.print_exc()
-    return {"ok": True, "stored": stored_id is not None, "id": stored_id}
+    try:
+        from graphops.response.gate import record_analyst_decision
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="decision store unavailable")
+    record, store = record_analyst_decision(
+        req.node_id, req.action, req.target, req.decision, req.rationale)
+    return {"ok": True, "id": record.get("id"), "stored": True,
+            "persistence": store}
 
 
 @app.get("/decisions")
 def list_decisions(limit: int = 50):
-    items = []
-    if _store is not None:
-        try:
-            items = _store.list_decisions(limit=min(max(limit, 1), 200))
-        except Exception:
-            traceback.print_exc()
+    items, store = [], "local"
+    try:
+        from graphops.response.gate import list_analyst_decisions
+        items, store = list_analyst_decisions(
+            limit=min(max(limit, 1), 200))
+    except Exception:
+        traceback.print_exc()
     # Approval queue: irreversible actions waiting on an analyst, enriched
     # with reversibility scores + business-impact cost. Never auto-executes.
     queue = []
@@ -388,7 +477,8 @@ def list_decisions(limit: int = 50):
     except Exception:
         traceback.print_exc()
     return {"decisions": items, "queue": queue,
-            "persisted": _store is not None and _store.is_configured(),
+            "persisted": store == "supabase",
+            "persistence": store,
             "queue_persisted": bool(queue)}
 
 

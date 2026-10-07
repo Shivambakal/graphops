@@ -7,6 +7,8 @@ actual code.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from graphops.graph.engine import GraphEngine
@@ -249,26 +251,48 @@ def test_decision_endpoint_validates_input(client):
     assert r.status_code == 400
 
 
-def test_decision_endpoint_accepts_approve_and_reject(client):
-    for d in ("approved", "rejected"):
-        r = client.post("/decisions", json={
-            "node_id": "host:ws-007", "action": "isolate_host",
-            "target": "host:ws-007", "decision": d,
-            "rationale": "test",
-        })
+def test_decision_endpoint_accepts_approve_and_reject(client, tmp_path):
+    # Redirect the local decisions store so the test never touches the repo.
+    os.environ["GRAPHOPS_DECISIONS_PATH"] = str(tmp_path / "decisions.json")
+    try:
+        for d in ("approved", "rejected"):
+            r = client.post("/decisions", json={
+                "node_id": "host:ws-007", "action": "isolate_host",
+                "target": "host:ws-007", "decision": d,
+                "rationale": "test",
+            })
+            assert r.status_code == 200
+            body = r.json()
+            assert body["ok"] is True
+            # no SUPABASE_URL in test env -> gitignored local JSON fallback
+            assert body["stored"] is True
+            assert body["persistence"] == "local"
+            assert body["id"]
+        # both decisions are listed back, newest first
+        r = client.get("/decisions")
         assert r.status_code == 200
         body = r.json()
-        assert body["ok"] is True
-        # no SUPABASE_URL in test env -> not persisted, but never an error
-        assert body["stored"] is False
+        assert len(body["decisions"]) == 2
+        assert body["persistence"] == "local"
+        assert body["persisted"] is False
+        assert {x["decision"] for x in body["decisions"]} == {
+            "approved", "rejected"}
+        assert all(x["executed"] is False for x in body["decisions"])
+    finally:
+        del os.environ["GRAPHOPS_DECISIONS_PATH"]
 
 
-def test_decisions_list_degrades_gracefully(client):
-    r = client.get("/decisions")
-    assert r.status_code == 200
-    body = r.json()
-    assert body["decisions"] == []
-    assert body["persisted"] is False
+def test_decisions_list_degrades_gracefully(client, tmp_path):
+    os.environ["GRAPHOPS_DECISIONS_PATH"] = str(tmp_path / "decisions2.json")
+    try:
+        r = client.get("/decisions")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["decisions"] == []
+        assert body["persisted"] is False
+        assert body["persistence"] == "local"
+    finally:
+        del os.environ["GRAPHOPS_DECISIONS_PATH"]
 
 
 def test_hunt_runs_list_degrades_gracefully(client):

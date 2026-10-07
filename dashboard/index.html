@@ -74,6 +74,7 @@
   <strong>API offline</strong>
   <span>— start it with:</span>
   <code>uvicorn graphops.api.server:app</code>
+  <button id="btnRetryApi" class="btn primary sm">↻ retry connection</button>
 </div>
 
 <!-- ============ MAIN GRID ============ -->
@@ -128,6 +129,7 @@
           <button id="btnView3d" role="tab" aria-selected="false">3D</button>
         </div>
         <span id="canvasStatus" class="muted small">layout idle</span>
+        <button id="btnColorMode" class="btn ghost sm" title="Toggle node coloring: entity type ↔ data classification (X)">◔ data color</button>
         <button id="btnDemo" class="btn accent">⚡ Run demo attack scenario</button>
       </div>
     </div>
@@ -149,7 +151,7 @@
         <span class="leg"><i class="dc-dot dc-regulated"></i>regulated ⚠</span>
       </div>
     </div>
-    <p class="hint muted small">2D: drag nodes · hover for detail · click a node for blast radius · title click → evidence chain &nbsp;|&nbsp; 3D: drag to orbit · scroll to zoom · click a node for blast radius &nbsp;|&nbsp; keys: <code>H</code> hunt · <code>D</code> demo · <code>E</code> evidence · <code>C</code> clear · <code>⌘K</code> commands</p>
+    <p class="hint muted small">2D: drag nodes · hover for detail · click a node for blast radius · title click → evidence chain &nbsp;|&nbsp; 3D: drag to orbit · scroll to zoom · click a node for blast radius &nbsp;|&nbsp; keys: <code>H</code> hunt · <code>D</code> demo · <code>E</code> evidence · <code>C</code> clear · <code>T</code> tour · <code>X</code> color · <code>⌘K</code> commands</p>
   </section>
 
   <!-- RIGHT: blast radius -->

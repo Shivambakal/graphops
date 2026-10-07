@@ -27,6 +27,10 @@ const EP_BLAST = API_BASE + '/blast-radius';
 const EP_GRAPH = API_BASE + '/graph';
 const EP_DECISIONS = API_BASE + '/decisions';
 const EP_DEMO_SCENARIOS = API_BASE + '/demo-scenarios';
+const EP_DEMO_RUN = (id) => API_BASE + '/demo-scenarios/' + encodeURIComponent(id) + '/run';
+// new red-team contract (backend ships it alongside/after the demo contract)
+const EP_REDEAM_SCENARIOS = API_BASE + '/redteam/scenarios';
+const EP_REDEAM_RUN = (id) => API_BASE + '/redteam/run/' + encodeURIComponent(id);
 const START_CMD = 'uvicorn graphops.api.server:app';
 const HUNT_AUTORELOAD_MS = 45000; // findings feed auto-refresh interval
 const HUNT_DEFAULT_LIMIT = 10;
@@ -39,6 +43,13 @@ const ETYPE_COLORS = {
   alert: '#f87171',
 };
 const ETYPE_DEFAULT = '#94a3b8';
+// data-classification color mode (toggle): uses real node attrs, zero hardcoding of values
+const DC_COLORS = {
+  regulated: '#ff2d55',
+  confidential: '#fbbf24',
+  internal: '#38bdf8',
+  public: '#5b6b82', // dim
+};
 
 /* ================= state ================= */
 const state = {
@@ -61,8 +72,15 @@ const state = {
   // hunt filters + pagination (contract: GET /hunt?severity=&method=&limit=&offset=;
   // falls back to POST /hunt + client-side filter/paginate when the backend lacks it)
   hunt: { severity: '', method: '', limit: HUNT_DEFAULT_LIMIT, offset: 0, total: null, serverMode: 'get' },
-  // red-team replay (contract: GET /demo-scenarios; POST /demo-scenarios/{id}/run)
-  scenarios: [], scenariosState: 'idle', lastScenarioRun: null,
+  // red-team replay (dual contract: GET /redteam/scenarios -> POST /redteam/run/{id},
+  // legacy: GET /demo-scenarios -> POST /demo-scenarios/{id}/run)
+  scenarios: [], scenariosState: 'idle', scenarioContract: null,
+  lastScenarioRun: null,
+  // 2D/3D node color mode: 'etype' | 'dc' (data classification)
+  colorMode: 'etype',
+  // decision-audit persistence: null = unknown (GET /decisions unreachable),
+  // true = persisted (Supabase store configured), false = in-memory only
+  persisted: null, queuePersisted: null,
 };
 
 /* ================= dom ================= */
@@ -86,6 +104,7 @@ const el = {
   btnPrevPage: $('btnPrevPage'), btnNextPage: $('btnNextPage'),
   scenarioStatus: $('scenarioStatus'), scenarioList: $('scenarioList'),
   scenarioResult: $('scenarioResult'),
+  btnRetryApi: $('btnRetryApi'), btnColorMode: $('btnColorMode'),
 };
 
 /* ================= toasts ================= */
@@ -157,6 +176,9 @@ async function init() {
   el.autoRefresh.addEventListener('change', () => setAutoRefresh(el.autoRefresh.checked));
   wireHuntFilters();
   if (el.btnBlastTour) el.btnBlastTour.addEventListener('click', tourBlastView);
+  if (el.btnRetryApi) el.btnRetryApi.addEventListener('click', retryConnection);
+  if (el.btnColorMode) el.btnColorMode.addEventListener('click', toggleColorMode);
+  renderQueueEmpty(); // explicit pre-blast empty state for the containment queue
   document.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape' && !el.drawer.hidden) closeDrawer();
   });
@@ -223,7 +245,53 @@ function setOnline() {
   el.btnDemo.disabled = false;
 }
 
-/* ================= graph ================= */
+/* Explicit offline retry — re-probes /health and restores the full boot
+ * sequence (graph, scenarios, hunt feed) when the API comes back. */
+async function retryConnection() {
+  toast('Retrying API connection…', 'info');
+  el.offlineBanner.hidden = true;
+  const up = await checkHealth();
+  if (!up) {
+    setOffline();
+    toast('API still offline — start it with: ' + START_CMD, 'err');
+    return;
+  }
+  setOnline();
+  setAutoRefresh(true);
+  await loadGraph();
+  await loadScenarios();
+  await runHunt({ silent: true });
+  toast('API back online — graph, scenarios and feed restored', 'ok');
+}
+
+/* ================= node color mode: entity type <-> data classification ================= */
+function nodeFill(n) {
+  if (state.colorMode === 'dc' && n.dc && DC_COLORS[n.dc]) return DC_COLORS[n.dc];
+  return ETYPE_COLORS[n.etype] || ETYPE_DEFAULT;
+}
+
+function toggleColorMode() {
+  state.colorMode = state.colorMode === 'etype' ? 'dc' : 'etype';
+  const dcOn = state.colorMode === 'dc';
+  const b = el.btnColorMode;
+  if (b) {
+    b.classList.toggle('active', dcOn);
+    b.textContent = dcOn ? '◑ type color' : '◔ data color';
+    b.title = dcOn
+      ? 'Nodes colored by data classification — click to switch back to entity type (X)'
+      : 'Toggle node coloring: entity type ↔ data classification (X)';
+  }
+  el.canvasStatus.textContent = dcOn
+    ? 'node color = data classification · regulated red · confidential amber · internal blue · public dim'
+    : `${state.nodes.length} nodes · ${state.edges.length} edges`;
+  if (window.Graph3D && typeof window.Graph3D.setColorMode === 'function') {
+    window.Graph3D.setColorMode(state.colorMode);
+  }
+  draw();
+  toast(dcOn
+    ? 'Nodes colored by data classification (real node attrs from the API)'
+    : 'Nodes colored by entity type', 'info');
+}
 async function loadGraph() {
   el.canvasStatus.textContent = 'fetching graph…';
   try {
@@ -378,7 +446,7 @@ function draw() {
   // nodes
   const showAllLabels = state.nodes.length > 0 && state.nodes.length <= 50;
   for (const n of state.nodes) {
-    const color = ETYPE_COLORS[n.etype] || ETYPE_DEFAULT;
+    const color = nodeFill(n);
     const isBlast = state.blastSet.has(n.id);
     const isPath = state.attackPath.has(n.id);
     const isExfil = state.exfilSet.has(n.id);
@@ -549,7 +617,7 @@ async function runHunt({ silent = false } = {}) {
       if (f.severity) arr = arr.filter((x) => String(x.severity ?? x.level ?? '').toLowerCase() === f.severity);
       if (f.method) {
         const m = f.method.toLowerCase();
-        arr = arr.filter((x) => String(x.detection_method ?? x.method ?? '').toLowerCase() === m);
+        arr = arr.filter((x) => findingMethod(x).toLowerCase() === m);
       }
       total = arr.length;
       raw = arr.slice(f.offset, f.offset + f.limit);
@@ -585,12 +653,13 @@ async function runHunt({ silent = false } = {}) {
 }
 
 /* method filter options are built ONLY from detection_method values the API
- * has actually returned — never invented, so a value is always valid to send. */
+ * has actually returned (incl. evidence_chain.detection_method) — never invented,
+ * so a value is always valid to send. */
 function populateMethodOptions(raw) {
   if (!el.huntMethod) return;
   const seen = new Set();
   for (const x of raw) {
-    const m = String(x.detection_method ?? x.method ?? '').trim();
+    const m = findingMethod(x);
     if (m && !seen.has(m)) {
       seen.add(m);
       const o = document.createElement('option');
@@ -627,13 +696,20 @@ function renderHuntSkeletons() {
   }
 }
 
+/* detection_method lives in evidence_chain on the real backend — read both
+ * shapes so the method filter options and client-side filtering stay truthful. */
+function findingMethod(x) {
+  const chain = (x && (x.evidence_chain ?? x.evidenceChain)) || {};
+  return String(x.detection_method ?? x.method ?? chain.detection_method ?? '').trim();
+}
+
 function normalizeFinding(f) {
   const ev = f.evidence ?? f.evidence_strings ?? f.details ?? [];
   const nodes = f.nodes ?? f.involved_nodes ?? f.node_ids ?? f.entities ?? [];
   return {
     title: String(f.title ?? f.name ?? ''),
     severity: String(f.severity ?? f.level ?? 'info'),
-    method: String(f.detection_method ?? f.method ?? ''),
+    method: findingMethod(f),
     evidence: (Array.isArray(ev) ? ev : [ev]).map(String).filter(Boolean),
     nodes: (Array.isArray(nodes) ? nodes : [nodes])
       .map((n) => String((n && typeof n === 'object' ? nodeIdOf(n) : n) ?? ''))
@@ -813,13 +889,38 @@ async function loadDecisions() {
       const a = r.action ?? r.action_name ?? '', t = r.target ?? r.node_id ?? '';
       if (a && r.decision) state.decisions.set(actionKey(a, t), String(r.decision));
     }
+    // contract: GET /decisions.persisted === true means the Supabase store is
+    // configured (decisions survive restarts); false/undefined = in-memory only
+    state.persisted = d.persisted === true;
+    state.queuePersisted = d.queue_persisted === true;
   } catch (e) { /* decisions history optional — queue still works */ }
+}
+
+/* Honest persistence badge for the containment queue, driven ONLY by the
+ * GET /decisions contract — never inferred, never invented. */
+function queuePersistLine() {
+  if (state.persisted === null) {
+    return '<div class="persist-line muted small">decision audit: persistence state unknown — ' +
+      '<code>GET /decisions</code> unreachable</div>';
+  }
+  return state.persisted
+    ? '<div class="persist-line"><span class="persist-badge ok">⛁ persisted → Supabase</span>' +
+      '<span class="muted small">decisions survive restarts</span></div>'
+    : '<div class="persist-line"><span class="persist-badge warn">⚠ in-memory only</span>' +
+      '<span class="muted small">Supabase store not configured — decisions are lost on restart</span></div>';
+}
+
+/* Explicit pre-blast empty state for the containment queue (no invented actions). */
+function renderQueueEmpty() {
+  el.actionsList.innerHTML =
+    '<p class="empty">No blast radius computed yet — the containment queue appears here. ' +
+    'Nothing to approve, nothing auto-executes.</p>';
 }
 
 async function decideAction(nodeId, action, target, decision, btn) {
   if (btn) btn.disabled = true;
   try {
-    await apiFetch(EP_DECISIONS, {
+    const res = await apiFetch(EP_DECISIONS, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -829,8 +930,12 @@ async function decideAction(nodeId, action, target, decision, btn) {
         rationale: `analyst ${decision} via dashboard (recommended action, reversible — human gate held)`,
       }),
     });
+    // contract: POST /decisions.stored === true means the audit record is durable
+    const stored = res && res.stored === true;
     state.decisions.set(actionKey(action, target), decision);
-    toast(`${decision === 'approved' ? '✓ approved' : '✕ rejected'}: ${action} → ${target}`, decision === 'approved' ? 'ok' : 'warn');
+    const verdict = decision === 'approved' ? '✓ approved' : '✕ rejected';
+    if (stored) toast(`${verdict}: ${action} → ${target}`, decision === 'approved' ? 'ok' : 'warn');
+    else toast(`${verdict}: ${action} → ${target} — recorded IN-MEMORY ONLY (Supabase not configured)`, 'warn');
     renderBlastActions(); // refresh row to show the audit badge
   } catch (e) {
     toast('Decision failed: ' + e.message, 'err');
@@ -840,8 +945,8 @@ async function decideAction(nodeId, action, target, decision, btn) {
 
 function renderBlastActions() {
   const b = state.blast;
-  if (!b) return;
-  el.actionsList.innerHTML = b.actions.length
+  if (!b) { renderQueueEmpty(); return; }
+  el.actionsList.innerHTML = queuePersistLine() + (b.actions.length
     ? b.actions.map((a) => {
         const key = actionKey(a.text, a.target);
         const decided = state.decisions.get(key);
@@ -865,7 +970,7 @@ function renderBlastActions() {
           </div>
         </div>`;
       }).join('')
-    : '<p class="muted small">no containment actions returned</p>';
+    : '<p class="muted small">no containment actions returned</p>');
   el.actionsList.querySelectorAll('.btn.decide').forEach((btn) => {
     btn.addEventListener('click', () => {
       const k = btn.dataset.k.split('|');
@@ -1003,62 +1108,118 @@ function tourBlastView() {
   toast(`Touring ${Math.min(10, state.blast.rows.length)} blast-radius nodes`, 'info');
 }
 
-/* ================= red-team replay (demo scenarios) =================
- * Contract: GET /demo-scenarios → [{id,name,description,severity,steps:[...]}]
- *           POST /demo-scenarios/{id}/run → {detected,mttd_seconds,mttc_seconds,
- *             false_positives,blast_radius_precision,findings}
- * All optional — a 404 renders an explicit "not available in this build" state.
+/* ================= red-team replay (dual contract) =================
+ * NEW contract (backend ships it today): GET /redteam/scenarios ->
+ *   POST /redteam/run/{id} -> {detected,mttd,mttc,false_positives,blast_radius_precision}
+ * LEGACY contract: GET /demo-scenarios -> POST /demo-scenarios/{id}/run
+ * The UI probes the new contract first and falls back to legacy; only when
+ * BOTH 404/405 does it render the explicit "not available in this build" state.
+ * Zero hardcoded scenarios — every card and metric comes from the API.
  */
+function scenarioRunUrl(id) {
+  return state.scenarioContract === 'redteam' ? EP_REDEAM_RUN(id) : EP_DEMO_RUN(id);
+}
+function scenarioContractLabel() {
+  return state.scenarioContract === 'redteam' ? 'GET /redteam/scenarios' : 'GET /demo-scenarios';
+}
+
+function normalizeScenario(s) {
+  // real contract: stages: [{stage, status, detection_delay_s, ...}]
+  // legacy contract: steps: [...]
+  const stageList = Array.isArray(s.stages) ? s.stages : [];
+  return {
+    id: String(s.id ?? ''),
+    name: String(s.name ?? s.id ?? ''),
+    description: String(s.description ?? ''),
+    severity: String(s.severity ?? ''),
+    steps: Array.isArray(s.steps) ? s.steps : stageList,
+    stages: stageList,
+    campaign: String(s.campaign ?? ''),
+  };
+}
+
 async function loadScenarios() {
   if (!el.scenarioStatus) return;
-  el.scenarioStatus.innerHTML = 'Loading scripted scenarios from <code>GET /demo-scenarios</code>…';
-  try {
-    const data = await apiFetch(EP_DEMO_SCENARIOS);
-    const list = Array.isArray(data) ? data : (data.scenarios ?? data.items ?? []);
-    state.scenarios = (Array.isArray(list) ? list : [])
-      .map((s) => ({
-        id: String(s.id ?? ''),
-        name: String(s.name ?? s.id ?? ''),
-        description: String(s.description ?? ''),
-        severity: String(s.severity ?? ''),
-        steps: Array.isArray(s.steps) ? s.steps : [],
-      }))
-      .filter((s) => s.id);
-    state.scenariosState = 'ready';
-    renderScenarios();
-  } catch (e) {
+  el.scenarioStatus.innerHTML =
+    'Probing <code>GET /redteam/scenarios</code> → fallback <code>GET /demo-scenarios</code>…';
+  el.scenarioList.innerHTML = '';
+  const attempts = [
+    { name: 'redteam', url: EP_REDEAM_SCENARIOS },
+    { name: 'demo', url: EP_DEMO_SCENARIOS },
+  ];
+  let found = null;
+  for (const a of attempts) {
+    try {
+      const data = await apiFetch(a.url);
+      const raw = Array.isArray(data) ? data : (data.scenarios ?? data.items ?? null);
+      if (Array.isArray(raw)) { found = { name: a.name, list: raw }; break; }
+    } catch (e) {
+      if (/HTTP 404|HTTP 405/.test(e.message)) continue; // contract absent — try next
+      // real error (500/network): surface it, never mask as "unsupported"
+      state.scenarioContract = null;
+      state.scenariosState = 'unsupported';
+      el.scenarioStatus.innerHTML =
+        `Red-team replay <b>error</b> on <code>${esc(a.url)}</code>: ${esc(e.message)}`;
+      return;
+    }
+  }
+  if (!found) {
+    state.scenarioContract = null;
     state.scenariosState = 'unsupported';
     el.scenarioStatus.innerHTML =
-      'Red-team replay <b>not available in this backend build</b> — <code>GET /demo-scenarios</code> failed: ' +
-      esc(e.message);
-    el.scenarioList.innerHTML = '';
+      'Red-team replay <b>not available in this backend build</b> — neither ' +
+      '<code>GET /redteam/scenarios</code> nor <code>GET /demo-scenarios</code> exists. ' +
+      'Deploy a newer backend, then press <b>↻ retry</b> in the banner above.';
+    return;
   }
+  state.scenarioContract = found.name;
+  state.scenarios = found.list.map(normalizeScenario).filter((s) => s.id);
+  state.scenariosState = 'ready';
+  renderScenarios();
 }
 
 function renderScenarios() {
   if (state.scenariosState !== 'ready') return;
-  el.scenarioStatus.textContent = state.scenarios.length
-    ? `${state.scenarios.length} scripted scenario${state.scenarios.length > 1 ? 's' : ''} — one-click replay against the graph. All metrics measured live by the API.`
-    : 'The API returned no scenarios.';
+  el.scenarioStatus.innerHTML = state.scenarios.length
+    ? `${state.scenarios.length} scripted scenario${state.scenarios.length > 1 ? 's' : ''} — one-click replay against the graph. ` +
+      `<span class="contract-src">contract: <code>${esc(scenarioContractLabel())}</code></span> · all metrics measured live by the API.`
+    : `The API returned no scenarios (<code>${esc(scenarioContractLabel())}</code>).`;
+  const stepWord = state.scenarioContract === 'redteam' ? 'stages' : 'steps';
   el.scenarioList.innerHTML = state.scenarios.map((s) =>
     `<div class="scenario">
        <div class="scenario-top"><b>${esc(s.name)}</b><span class="sev ${sevClass(s.severity)}">${esc(s.severity || 'n/a')}</span></div>
        ${s.description ? `<p class="muted small">${esc(s.description)}</p>` : ''}
        <div class="scenario-foot">
-         <span class="muted small">${s.steps.length} steps</span>
+         <span class="muted small">${s.steps.length} ${stepWord}${s.campaign ? ` · <code>${esc(s.campaign)}</code>` : ''}</span>
          <button class="btn accent sm" data-run="${esc(s.id)}">▶ Run</button>
        </div>
      </div>`).join('');
   el.scenarioList.querySelectorAll('[data-run]').forEach((btn) =>
     btn.addEventListener('click', () => runScenario(btn.dataset.run)));
+  const g = window.gsap;
+  if (g && state.scenarios.length) {
+    g.from('#scenarioList .scenario',
+      { x: -14, opacity: 0, duration: 0.4, stagger: 0.08, ease: 'power2.out', overwrite: true });
+  }
 }
 
 async function runScenario(id) {
   const s = state.scenarios.find((x) => x.id === id);
   el.scenarioResult.hidden = false;
-  el.scenarioResult.innerHTML = `<p class="muted small">running scenario <code>${esc(id)}</code>… (POST /demo-scenarios/{id}/run)</p>`;
+  el.scenarioResult.innerHTML =
+    `<p class="muted small">running scenario <code>${esc(id)}</code>… ` +
+    `(<code>POST ${esc(scenarioRunUrl(id).replace(API_BASE, ''))}</code>)</p>`;
   try {
-    const r = await apiFetch(EP_DEMO_SCENARIOS + '/' + encodeURIComponent(id) + '/run', { method: 'POST' });
+    let r;
+    try {
+      r = await apiFetch(scenarioRunUrl(id), { method: 'POST' });
+    } catch (e) {
+      if (/HTTP 404|HTTP 405/.test(e.message)) {
+        // cross-contract fallback: the run endpoint may live under the other contract
+        state.scenarioContract = state.scenarioContract === 'redteam' ? 'demo' : 'redteam';
+        r = await apiFetch(scenarioRunUrl(id), { method: 'POST' });
+      } else throw e;
+    }
     renderScenarioResult(s, r);
   } catch (e) {
     el.scenarioResult.innerHTML = `<p class="err-text">Scenario run failed: ${esc(e.message)}</p>`;
@@ -1072,50 +1233,99 @@ function fmtMetric(v, suffix) {
   return n.toLocaleString(undefined, { maximumFractionDigits: 2 }) + (suffix || '');
 }
 
+/* Scenario-result normalization — two real contracts, one card.
+ * Legacy (/demo-scenarios/{id}/run): {detected: bool, mttd_seconds, mttc_seconds,
+ *   false_positives, blast_radius_precision (percent)}
+ * New (/redteam/run/{id}): {detected: <count>, missed: <count>, coverage: "5/7",
+ *   mttd_seconds, mttc_seconds, blast_radius: {precision: <fraction>, ...},
+ *   stages: [{stage, status: detected|missed, detection_delay_s}], detections_fired_total}
+ * Every number on screen comes from the API response — nothing invented.
+ */
 function renderScenarioResult(s, r) {
-  const detected = r.detected === true;
+  const stages = Array.isArray(r.stages) ? r.stages : [];
+  const missed = typeof r.missed === 'number' ? r.missed : null;
+  const detectedCount = typeof r.detected === 'number' ? r.detected
+    : (stages.length
+        ? stages.filter((st) => String(st.status || '').toLowerCase() === 'detected').length
+        : (r.detected === true ? 1 : 0));
+  const totalStages = stages.length || (missed !== null ? detectedCount + missed : null);
+  const coverage = r.coverage ?? (totalStages ? `${detectedCount}/${totalStages}` : null);
+  const detected = detectedCount > 0 || r.detected === true;
   const mttd = r.mttd_seconds ?? r.mttd ?? null;
-  const mttc = r.mttc_seconds ?? r.mttc ?? null;
+  const mttc = r.mttc_seconds ?? r.mttc ?? r.analyst_response_sla_seconds ?? null;
   const fp = r.false_positives ?? r.falsePositives ?? r.fp ?? null;
-  const prec = r.blast_radius_precision ?? r.precision ?? null;
+  const fired = r.detections_fired_total ?? r.detectionsFiredTotal ?? null;
+  let prec = r.blast_radius_precision ?? r.blast_precision ?? r.precision ??
+    ((r.blast_radius && typeof r.blast_radius === 'object') ? r.blast_radius.precision : null) ?? null;
+  // new contract reports precision as a fraction (0.024) — legacy as percent (91.7)
+  if (prec !== null && prec !== undefined && prec !== '' && Number.isFinite(Number(prec))) {
+    const pn = Number(prec);
+    prec = (pn > 0 && pn <= 1) ? pn * 100 : pn;
+  }
+  const verdict = detected
+    ? (coverage ? `✓ DETECTED ${coverage} stages` : '✓ DETECTED')
+    : '✕ NOT DETECTED';
   state.lastScenarioRun = {
     name: s ? s.name : '', id: s ? s.id : '',
-    detected, mttd, mttc, fp, prec,
+    detected, coverage, mttd, mttc, fp, fired, prec,
   };
+  const timeline = stages.length
+    ? `<div class="stage-timeline" aria-label="attack stage timeline">` + stages.map((st) => {
+        const ok = String(st.status || '').toLowerCase() === 'detected';
+        const delay = st.detection_delay_s ?? st.delay_s;
+        return `<div class="stage ${ok ? 'hit' : 'miss'}" title="${esc(String(st.status || ''))}">` +
+          `<span class="stage-dot"></span>` +
+          `<span class="stage-name">${esc(st.stage ?? st.name ?? '')}</span>` +
+          `<span class="stage-delay">${ok && delay !== null && delay !== undefined ? esc(delay) + 's' : '—'}</span>` +
+          `</div>`;
+      }).join('') + `</div>`
+    : '';
   el.scenarioResult.innerHTML = `
     <div class="scenario-res-top">
-      <span class="det ${detected ? 'yes' : 'no'}">${detected ? '✓ DETECTED' : '✕ NOT DETECTED'}</span>
+      <span class="det ${detected ? 'yes' : 'no'}">${esc(verdict)}</span>
       <b>${esc(s ? s.name : '')}</b>
     </div>
     <div class="scenario-metrics">
       <div><span class="sm-num">${fmtMetric(mttd)}</span><span class="sm-label">MTTD (s)</span></div>
       <div><span class="sm-num">${fmtMetric(mttc)}</span><span class="sm-label">MTTC (s)</span></div>
-      <div><span class="sm-num">${fmtMetric(fp)}</span><span class="sm-label">false positives</span></div>
+      <div><span class="sm-num">${fp !== null ? fmtMetric(fp) : (fired !== null ? fmtMetric(fired) : '—')}</span><span class="sm-label">${fp !== null ? 'false positives' : 'detections fired'}</span></div>
       <div><span class="sm-num">${fmtMetric(prec, '%')}</span><span class="sm-label">blast precision</span></div>
     </div>
+    ${timeline}
     <div class="scenario-res-foot">
       <button class="btn ghost sm" id="btnCopyDemoScript">⧉ copy demo script</button>
-      <span class="muted small">measured by the API, not scripted</span>
+      <span class="muted small">measured by the API, not scripted · <span class="contract-src"><code>${esc('POST ' + scenarioRunUrl(s ? s.id : '').replace(API_BASE, ''))}</code></span></span>
     </div>`;
   const cb = document.getElementById('btnCopyDemoScript');
   if (cb) cb.addEventListener('click', copyDemoScript);
+  // animated results card: verdict pops, metric cells + stage chips cascade in
   const g = window.gsap;
-  if (g) g.from(el.scenarioResult, { opacity: 0, y: 8, duration: 0.4, ease: 'power2.out' });
+  if (g) {
+    const det = el.scenarioResult.querySelector('.det');
+    if (det) g.from(det, { scale: 0.55, opacity: 0, duration: 0.38, ease: 'back.out(2.4)', overwrite: true });
+    const cells = el.scenarioResult.querySelectorAll('.scenario-metrics > div, .stage-timeline .stage');
+    if (cells.length) {
+      g.from(cells, { y: 12, opacity: 0, duration: 0.35, stagger: 0.06, ease: 'power2.out', delay: 0.12, overwrite: true });
+    }
+  }
 }
 
 /* judge-friendly narration — every number is a real measured value from the run above */
 function copyDemoScript() {
   const r = state.lastScenarioRun;
   if (!r) return;
-  const verdict = r.detected ? 'detected the campaign' : 'did NOT detect the campaign';
+  const verdict = r.detected
+    ? (r.coverage ? `detected ${r.coverage} of the attack stages` : 'detected the campaign')
+    : 'did NOT detect the campaign';
   const mttd = r.mttd !== null && r.mttd !== undefined ? r.mttd + 's' : 'n/a';
   const mttc = r.mttc !== null && r.mttc !== undefined ? r.mttc + 's' : 'n/a';
-  const fp = r.fp !== null && r.fp !== undefined ? r.fp : 'n/a';
+  const fp = r.fp !== null && r.fp !== undefined ? 'false positives ' + r.fp
+    : (r.fired !== null && r.fired !== undefined ? 'detections fired ' + r.fired : 'n/a');
   const prec = r.prec !== null && r.prec !== undefined ? r.prec + '%' : 'n/a';
   const text =
 `GraphOps red-team replay — "${r.name}"
 We replayed a scripted attack campaign against the SOC graph and GraphOps ${verdict}.
-Measured live: MTTD ${mttd} · MTTC ${mttc} · false positives ${fp} · blast-radius precision ${prec}.
+Measured live: MTTD ${mttd} · MTTC ${mttc} · ${fp} · blast-radius precision ${prec}.
 Containment stays human-gated: every action is a recommendation awaiting analyst approval — nothing auto-executes.`;
   if (!navigator.clipboard || !navigator.clipboard.writeText) {
     toast('Clipboard unavailable in this browser context', 'err');
@@ -1284,6 +1494,11 @@ function exposeBridge() {
       : null),
     getScenarios: () => state.scenarios,
     runScenario,
+    getScenarioContract: () => state.scenarioContract,
+    getPersisted: () => state.persisted,
+    toggleColorMode, getColorMode: () => state.colorMode,
+    tourBlastView,
+    retryConnection,
     getAttackPath: () => state.attackPath,
     getFindings: () => state.findings,
     runHunt: (opts) => runHunt(opts || {}),

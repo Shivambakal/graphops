@@ -15,6 +15,13 @@ const ETYPE_HEX = {
 const ETYPE_DEFAULT = 0x94a3b8;
 const RISK_HEX = new THREE.Color(0xff2d55);
 const REGULATED_HEX = new THREE.Color(0xff2d55); // crimson — DPDP regulated-data halo
+// data-classification color mode (mirror of dashboard DC_COLORS, 2D↔3D sync)
+const DC_HEX = {
+  regulated: 0xff2d55,
+  confidential: 0xfbbf24,
+  internal: 0x38bdf8,
+  public: 0x5b6b82, // dim
+};
 
 const G = {
   inited: false,
@@ -33,6 +40,7 @@ const G = {
   shockwaves: [],
   tooltip: null, container: null,
   onNodeClick: null,
+  colorMode: 'etype',  // 'etype' | 'dc' — synced from app.js toggle
   raf: 0, clock: new THREE.Clock(),
   sphereGeo: null,
 };
@@ -317,6 +325,10 @@ function applyBlastColors() {
     const u = mesh.userData;
     const risk = G.blastRisk.get(u.id);
     const regulated = isRegulatedMesh(u);
+    // color-mode tint: node base color comes from data classification when enabled
+    const dcTint = (G.colorMode === 'dc' && u.dc && DC_HEX[u.dc] !== undefined)
+      ? new THREE.Color(DC_HEX[u.dc]) : null;
+    const base = dcTint || u.baseColor;
     if (G.exfilSet.has(u.id)) {
       // exfil-risk overlay wins: suspected C2/exfil endpoint, hot amber
       mesh.material.color.copy(EXFIL_HEX);
@@ -327,7 +339,7 @@ function applyBlastColors() {
       mesh.material.emissive.copy(REGULATED_HEX).multiplyScalar(0.55);
     } else if (risk !== undefined && risk !== null && Number.isFinite(Number(risk))) {
       const rn = Math.max(0, Math.min(1, Number(risk) <= 1 ? Number(risk) : Number(risk) / 100));
-      mesh.material.color.copy(u.baseColor).lerp(RISK_HEX, 0.25 + rn * 0.65);
+      mesh.material.color.copy(base).lerp(RISK_HEX, 0.25 + rn * 0.65);
       mesh.material.emissive.copy(mesh.material.color).multiplyScalar(0.55);
     } else if (G.blastSet.has(u.id)) {
       mesh.material.color.set(0x22d3ee);
@@ -337,10 +349,17 @@ function applyBlastColors() {
       mesh.material.color.copy(u.baseColor);
       mesh.material.emissive.copy(u.baseColor).multiplyScalar(0.55);
     } else {
-      mesh.material.color.copy(u.baseColor);
-      mesh.material.emissive.copy(u.baseColor).multiplyScalar(0.25);
+      mesh.material.color.copy(base);
+      mesh.material.emissive.copy(base).multiplyScalar(0.25);
     }
   }
+}
+
+/* ---------- node color mode: entity type <-> data classification ---------- */
+function setColorMode(m) {
+  G.colorMode = m === 'dc' ? 'dc' : 'etype';
+  if (!G.inited) return;
+  applyBlastColors();
 }
 
 function setBlast(idSet, riskById) {
@@ -580,12 +599,13 @@ function setVisible(v) {
 
 window.Graph3D = {
   init, setData, setBlast, setExfil, setAttackPath, setVisible, resize, flyTo,
-  setRegulated, tourBlast,
+  setRegulated, tourBlast, setColorMode,
   // read-only debug surface for automated verification (no state mutation)
   debug: () => ({
     nodes: G.meshes.length,
     regulated: G.regulatedSet.size,
     halos: G.regHalos.length,
+    colorMode: G.colorMode,
     tourCapable: typeof tourBlast === 'function',
   }),
 };
