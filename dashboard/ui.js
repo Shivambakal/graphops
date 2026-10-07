@@ -130,6 +130,8 @@ const UI = (() => {
     const cmds = [
       { title: 'Run hunt', hint: 'POST /hunt · H', run: () => ops.runHunt && ops.runHunt({}) },
       { title: 'Run demo attack scenario', hint: 'hunt + highlight · D', run: () => ops.runDemo && ops.runDemo() },
+      { title: 'Open red-team replay panel', hint: 'demo scenarios · metrics · copy demo script',
+        run: () => { const r = document.getElementById('replay'); if (r) r.scrollIntoView({ behavior: 'smooth', block: 'start' }); } },
       { title: (ops.isAutoRefresh && ops.isAutoRefresh()) ? 'Pause hunt auto-refresh' : 'Resume hunt auto-refresh',
         hint: '45s polling', run: () => ops.toggleAutoRefresh && ops.toggleAutoRefresh() },
       { title: 'Open evidence chain (latest finding)', hint: 'E', run: () => {
