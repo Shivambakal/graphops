@@ -420,8 +420,12 @@ def test_api_blast_radius_malformed_body_is_422(client):
     assert r.status_code == 422  # node_id is required
 
 
-def test_api_blast_radius_empty_string_node_is_404(client):
+def test_api_blast_radius_empty_string_node_is_422(client):
+    # 2026-10-08 input-validation hardening: empty node_id is a 422;
+    # unknown-but-wellformed ids still 404 (contract preserved)
     r = client.post("/blast-radius", json={"node_id": ""})
+    assert r.status_code == 422
+    r = client.post("/blast-radius", json={"node_id": "host:ghost-zzz"})
     assert r.status_code == 404
 
 

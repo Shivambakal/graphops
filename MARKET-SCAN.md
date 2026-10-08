@@ -132,3 +132,55 @@ Each entry: date, what it is, source link, how we could use it.
 
 
 ---
+
+---
+
+## 2026-10-08 — Daily scan
+
+### 1. CrowdSec breach — departing engineer's GitHub access kept alive, harvested via Shai-Hulud, source code stolen, found 4 months later (Oct 6, 2026)
+- **Date:** Published Oct 6, 2026.
+- **What:** A departing CrowdSec engineer got a routine exception to keep GitHub access for extra wrap-up time. The engineer's personal laptop was later infected by malicious TanStack NPM packages carrying Shai-Hulud malware, which harvested developer credentials and tokens; attackers used the still-live GitHub access to download private CrowdSec repositories. CrowdSec only discovered it ~4 months later when stolen source code surfaced on a public forum. Core lesson: offboarding is a credential-state problem, not a calendar date — developer access lives in personal access tokens, SSH keys, and third-party SaaS, not just the corporate account.
+- **Source:** https://www.techtarget.com/cybersecurity/news/366651571/CrowdSec-breach-exposes-security-blind-spots-in-developer-access
+- **Use in GraphOps:** Third named 2026 demo scenario (after Klue/Icarus, Vercel/OAuth). Model: Employee node → GitHub OAuth/PAT edge → exception-flagged grant (no platform-enforced expiry) → stolen token via endpoint malware → private repo exfiltration, with a 4-month dwell. Add an "orphaned exception" hunt preset: grants/tokens surviving past the offboarding date with no expiry — exactly the graph query judges will ask about.
+
+### 2. AWS Loom flaws — OAuth2 token theft via MCP/A2A scopes + SageMaker credential disclosure (fixed Aug 2026, reported ~Oct 4, 2026)
+- **Date:** Flaws fixed in Loom 1.6.1 (Aug 4, 2026) and 1.7.0; reported Oct 4, 2026.
+- **What:** AWS patched four issues: CVE-2026-103957 (unsafe OAuth2 discovery-URL handling — an authenticated user with `mcp:write` or `a2a:write` scope could point the Loom backend at an attacker-controlled discovery endpoint, sending OAuth2 client secrets or another user's access token to it); CVE-2026-103958 (SSRF in Loom's MCP tool server/Agent2Agent connection logic, able to reach container credential-vending endpoints and expose temporary AWS credentials); plus an auth bypass and a SageMaker Space startup-script command injection (CVE-2026-104019) that could yield another member's Trusted Identity Propagation credentials.
+- **Source:** https://completeaitraining.com/news/aws-fixes-authentication-bypass-and-token-theft-flaws-in/
+- **Use in GraphOps:** This is the NHI/agentic-identity blast radius made concrete: OAuth scopes (`mcp:write`, `a2a:write`) become attack edges. Add MCP/A2A servers and agent tool scopes as node types in the identity graph with a "scope-grant abuse path" hunt. Also a framing gem for Judge Ganapathy: agents themselves are NHIs with token-bearing edges — they must be inventoried like any other identity, not trusted by default.
+
+### 3. ClearVector 2026 Identity Intelligence Report — NHIs are 91% of active production identities (report cited Aug 2026)
+- **Date:** Reported Aug 6, 2026 (ClearVector 2026 Identity Intelligence Report, drawn from AWS/Google Cloud environments).
+- **What:** 91% of active identities in production belong to machines (service accounts, execution roles, managed identities, vendor credentials). Only 20% of non-human activity falls inside business hours — time-of-day tells defenders almost nothing. June 2026: stolen credentials + trusted publishing workflows pushed malicious packages through Red Hat's legitimate channels ("Miasma"); April 2026: LiteLLM compromise fed the Mercor breach; May 2026: researchers watched an LLM-driven workflow use harvested cloud credentials to pull secrets from AWS Secrets Manager.
+- **Source:** https://www.helpnetsecurity.com/2026/08/06/non-human-identities-active-in-production/
+- **Use in GraphOps:** Two things. (a) PPT stats for the NHI blind-spot slide: "91% of production identities are machines; only 20% of their activity happens during business hours." (b) A new hunt preset: "off-hours NHI anomaly" is weak — instead detect *attribution-less* privileged NHI actions, since time-of-day is admitted noise. Pairs with the Oct 7 Keycloak `act`/`sub` entry: flag actions missing an attributable actor.
+
+### 4. SpyCloud 2026 Identity Threat Report — compromised NHIs now the #1 enterprise entry point (Sep 9, 2026)
+- **Date:** Published Sep 9, 2026.
+- **What:** Survey-based study: compromised non-human identities (31%) are now ~2x as likely to be the primary entry point as phishing/social engineering (17%), the #2 answer. NHI misuse was the most commonly reported identity event type (42%). Yet 95% of organizations believe they have visibility into AI/machine identity exposures while only 36% actually monitor them — the least-watched identity risk category. 68% of orgs experienced an identity-based event, averaging 8 each.
+- **Source:** https://www.csoonline.com/article/4220209/spycloud-2026-identity-threat-report-finds-non-human-identities-are-now-the-leading-path-into-the-enterprise.html
+- **Use in GraphOps:** The single strongest authority citation for the entire GraphOps premise: NHIs outrank phishing as the entry point and almost nobody watches them. Put the "31% vs 17% / 95% believe, 36% monitor" pair on the problem statement slide verbatim. Also validates the NHI inventory view as the hero screen of the dashboard, not an add-on.
+
+### 5. OCC launches Bedrock SOC Agent — agentic investigation with human-in-the-loop control, interpretable and auditable (Sep 29, 2026)
+- **Date:** Announced Sep 29, 2026.
+- **What:** The Options Clearing Corporation (world's largest equity derivatives clearing org) launched a Bedrock-built SOC agent that automates alert investigation — forming lines of inquiry, retrieving evidence, evaluating findings — while delivering interpretable, auditable results and keeping human experts firmly in control of the process and outcomes, with a human-in-the-loop feedback system for continuous improvement. AWS framed it as preserving "the critical human judgment that security requires."
+- **Source:** https://press.aboutamazon.com/aws/2026/9/occ-strengthens-security-operations-with-an-agentic-ai-investigation-solution-built-on-aws
+- **Use in GraphOps:** Market-validation gold for Judge Agarwal's "humans supervise critical decisions" bar: even a systemically important clearing corp ships agentic investigation but keeps humans in control — exactly our reversibility-gated containment thesis. Cite on the "why human approval" slide. Also mirror their pattern: investigation lines of inquiry as an auditable sequence we log into our evidence-chain ledger.
+
+### 6. Zscaler Agentic SOC — "data-rich context graph" at the core of detect/investigate/respond (Sep 9, 2026)
+- **Date:** Announced Sep 9, 2026.
+- **What:** Zscaler's new platform centers on a "data-rich context graph" correlating real-time zero-trust telemetry with third-party data to map, prioritize, and investigate complex incident chains; specialized AI agents handle triage, root-cause investigation, verdicts, and response workflows; closed-loop inline remediation isolates users, blocks C2, and cuts lateral movement at machine speed. Built on 750 billion daily zero-trust transactions and the world's largest decoy mesh network.
+- **Source:** https://www.globenewswire.com/news-release/2026/09/09/3358327/0/en/zscaler-launches-agentic-soc-to-contain-ai-driven-threats.html
+- **Use in GraphOps:** A global security vendor independently converged on "context graph at the center of the SOC" — our architecture thesis, named on a launch press release a month before submission. Use the phrase "data-rich context graph" in the PPT to signal category alignment, then differentiate: Zscaler's remediation is closed-loop/auto; GraphOps is reversibility-gated/human-approved. That contrast is the moat slide.
+
+### 7. DPDP — Board still not set up with 5 weeks to the Nov 13 enforcement milestone (Oct 5, 2026)
+- **Date:** Published Oct 5, 2026.
+- **What:** With the Consent Manager registration window opening Nov 13, 2026, privacy-tech firms are holding back from registering: the key adjudicating authority (Data Protection Board of India) is yet to be set up and the Board's detailed guidelines on the Consent Manager regime are unpublished. Meanwhile a companion compliance explainer notes enforcement powers (inquiries + penalties up to ₹250 crore per instance for security-safeguard failures) arrive Nov 13, 2026, six months before substantive obligations bite (May 13, 2027) — 2026 is deliberate "soft enforcement" (guidance, warnings, inquiries), not the punitive phase.
+- **Source:** https://www.thehindubusinessline.com/info-tech/dpdp-privacy-tech-firms-weigh-consent-manager-role-await-regulatory-uncertainty-and-board-formation/article71544123.ece/amp/ · https://myprivacy.blog/india-dpdp-november-2026-enforcement-clock/
+- **Use in GraphOps:** Freshens the Oct 7 DPDP entry: the Nov 13, 2026 countdown is now ~5 weeks away with an unstaffed Board — sharpen the 72h breach-clock panel to show "soft enforcement now, ₹250cr exposure from May 2027." Also honest note for the handoff UX: filing recommendations are advisory until the Board publishes procedures — don't overclaim in the containment card.
+
+### 8. HackFront India 2026 — no new organizer/judging/timeline updates in the last ~90 days (checked Oct 8, 2026)
+- **Date:** Checked Oct 8, 2026; last public coverage remains June 13–21, 2026 launch press (Leadership Forum, Constitution Club of India).
+- **What:** Web search surfaced no new Where U Elevate announcements on rules, judging criteria, named judges/mentors, or timeline shifts. Standing dashboard facts unchanged: prototype submission Sep 22–Oct 25 (11:59 PM IST; safe target 6:29 PM), 30-hr finale Nov 21–22 Delhi-NCR, GTM cohorts Dec 1–27; Cybersecurity's single problem statement = GraphOps. Launch framing to echo: "innovation decade," creators-not-consumers.
+- **Source:** https://www.europeansuntimes.com/news/as-bharat-innovates-goes-global-hackfront-india-launches-to-power-the-next-million-innovators20260616153820//
+- **Use in GraphOps:** No action — hold all assumptions, keep the countdown cadence and portal-watch cron. The standing absence finding persists for the fourth consecutive scan.

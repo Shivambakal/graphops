@@ -77,6 +77,8 @@ AUTO_APPROVE_MIN_REVERSIBILITY = 0.90
 
 STATUS_RECOMMENDED = "recommended"
 STATUS_QUEUED = "queued_for_approval"
+STATUS_RESOLVED_APPROVED = "resolved_approved"
+STATUS_RESOLVED_REJECTED = "resolved_rejected"
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +149,20 @@ def _local_append(record: Dict[str, Any]) -> None:
         tmp = p.with_suffix(".tmp")
         with open(tmp, "w") as f:
             json.dump(records, f, indent=2)
+        os.chmod(tmp, 0o600)  # queue may hold attacker IOCs — owner-only
+        tmp.replace(p)
+    except OSError:
+        pass
+
+
+def _local_write_all(records: List[Dict[str, Any]]) -> None:
+    try:
+        p = _queue_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        with open(tmp, "w") as f:
+            json.dump(records, f, indent=2)
+        os.chmod(tmp, 0o600)  # queue may hold attacker IOCs — owner-only
         tmp.replace(p)
     except OSError:
         pass
@@ -158,13 +174,57 @@ def queue_action(decision: Dict[str, Any],
 
     Returns (queued_record, store) where store is "supabase" or "local".
     The record is NOT executed — it waits for an analyst approve/reject.
+
+    Local-store dedup: an identical (node_id, action, target) that is still
+    pending is returned as-is instead of queuing a second copy — the analyst
+    should never see the same irreversible action twice in the queue.
     """
+    try:
+        from graphops.store import supabase_client as _store
+        if _store is not None and _store.is_configured():
+            rid = _store.record_queued_action({
+                "node_id": decision.get("node_id", ""),
+                "action": decision.get("action", ""),
+                "target": decision.get("target", ""),
+                "reversibility_score": decision.get("reversibility_score"),
+                "impact_tier": decision.get("impact_tier"),
+                "est_cost_usd": decision.get("est_cost_usd"),
+                "status": STATUS_QUEUED,
+                "context": dict(decision.get("context") or {}),
+                "requested_by": requested_by,
+            })
+            if rid:
+                return {
+                    "id": rid,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "node_id": decision.get("node_id", ""),
+                    "action": decision.get("action", ""),
+                    "target": decision.get("target", ""),
+                    "reversibility_score": decision.get("reversibility_score"),
+                    "impact_tier": decision.get("impact_tier"),
+                    "est_cost_usd": decision.get("est_cost_usd"),
+                    "status": STATUS_QUEUED,
+                    "context": dict(decision.get("context") or {}),
+                    "requested_by": requested_by,
+                }, "supabase"
+    except Exception:
+        pass
+    # local dedup: same pending action must not queue twice
+    node_id = str(decision.get("node_id", ""))
+    action = str(decision.get("action", ""))
+    target = str(decision.get("target", ""))
+    for rec in _local_read():
+        if (rec.get("status") == STATUS_QUEUED
+                and str(rec.get("node_id")) == node_id
+                and str(rec.get("action")) == action
+                and str(rec.get("target")) == target):
+            return rec, "local"
     record = {
         "id": uuid.uuid4().hex,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "node_id": decision.get("node_id", ""),
-        "action": decision.get("action", ""),
-        "target": decision.get("target", ""),
+        "node_id": node_id,
+        "action": action,
+        "target": target,
         "reversibility_score": decision.get("reversibility_score"),
         "impact_tier": decision.get("impact_tier"),
         "est_cost_usd": decision.get("est_cost_usd"),
@@ -172,30 +232,66 @@ def queue_action(decision: Dict[str, Any],
         "context": dict(decision.get("context") or {}),
         "requested_by": requested_by,
     }
-    try:
-        from graphops.store import supabase_client as _store
-        if _store is not None and _store.is_configured():
-            rid = _store.record_queued_action(record)
-            if rid:
-                record["id"] = rid
-                return record, "supabase"
-    except Exception:
-        pass
     _local_append(record)
     return record, "local"
 
 
-def list_queued(limit: int = 100) -> List[Dict[str, Any]]:
-    """List queued (pending-approval) containment actions, newest first."""
+def list_queued(limit: int = 100,
+              only_pending: bool = True) -> List[Dict[str, Any]]:
+    """List containment actions waiting on analyst approval, newest first.
+
+    only_pending=True (default) hides records already resolved by an analyst
+    decision (resolved_approved / resolved_rejected) — the queue is the
+    pending work list, not the audit trail.
+    """
     try:
         from graphops.store import supabase_client as _store
         if _store is not None and _store.is_configured():
-            return _store.list_queued_actions(limit=limit)
+            rows = _store.list_queued_actions(limit=limit)
+            if only_pending:
+                rows = [r for r in rows
+                        if str(r.get("status")) == STATUS_QUEUED]
+            return rows
     except Exception:
         pass
     records = _local_read()
+    if only_pending:
+        records = [r for r in records
+                   if str(r.get("status")) == STATUS_QUEUED]
     records.sort(key=lambda r: str(r.get("created_at", "")), reverse=True)
     return records[: max(int(limit), 1)]
+
+
+def resolve_queued_action(node_id: str, action: str, target: str,
+                          decision: str) -> int:
+    """Mark pending queue records resolved after an analyst decision.
+
+    Matches on (node_id, action, target); approved decisions mark
+    resolved_approved, rejected ones resolved_rejected. Returns the number
+    of records transitioned. Local store only — the Supabase client has no
+    update endpoint. Never raises; a resolution failure must never break
+    the /decisions audit write.
+    """
+    status = (STATUS_RESOLVED_APPROVED if decision == "approved"
+              else STATUS_RESOLVED_REJECTED)
+    try:
+        records = _local_read()
+        changed = 0
+        now = datetime.now(timezone.utc).isoformat()
+        for r in records:
+            if (str(r.get("status")) == STATUS_QUEUED
+                    and str(r.get("node_id")) == str(node_id)
+                    and str(r.get("action")) == str(action)
+                    and str(r.get("target")) == str(target)):
+                r["status"] = status
+                r["resolution"] = decision
+                r["resolved_at"] = now
+                changed += 1
+        if changed:
+            _local_write_all(records)
+        return changed
+    except Exception:
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +323,7 @@ def _decisions_local_append(record: Dict[str, Any]) -> None:
         tmp = p.with_suffix(".tmp")
         with open(tmp, "w") as f:
             json.dump(records, f, indent=2)
+        os.chmod(tmp, 0o600)  # audit trail — owner-only
         tmp.replace(p)
     except OSError:
         pass

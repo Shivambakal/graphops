@@ -63,19 +63,22 @@ def _restore_ingest_state():
 # 1. /ingest resilience: malformed payloads must degrade, never 500
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("payload", [
-    {"logs": "this is not csv or json {{{", "format": "auto"},
-    {"logs": "not json at all", "format": "json"},
-    {"logs": "", "format": "auto"},
-    {"logs": "a,b\n1,2\n", "format": "xml"},  # unknown format -> auto, not crash
-    {"logs": "timestamp\nnot-a-time\n,,,\n", "format": "csv"},
+@pytest.mark.parametrize("payload,want", [
+    ({"logs": "this is not csv or json {{{", "format": "auto"}, 200),
+    ({"logs": "not json at all", "format": "json"}, 200),
+    # 2026-10-08 input-validation hardening: empty logs and unknown
+    # formats are rejected with 422 instead of silently ingested
+    ({"logs": "", "format": "auto"}, 422),
+    ({"logs": "a,b\n1,2\n", "format": "xml"}, 422),
+    ({"logs": "timestamp\nnot-a-time\n,,,\n", "format": "csv"}, 200),
 ])
-def test_ingest_malformed_logs_never_500(client, payload):
+def test_ingest_malformed_logs_never_500(client, payload, want):
     r = client.post("/ingest", json=payload)
-    assert r.status_code == 200, f"payload {payload['format']} failed: {r.status_code}"
-    body = r.json()
-    assert body["ok"] is True
-    assert body["nodes"] >= 0 and body["edges"] >= 0
+    assert r.status_code == want, f"payload {payload['format']}: {r.status_code}"
+    if want == 200:
+        body = r.json()
+        assert body["ok"] is True
+        assert body["nodes"] >= 0 and body["edges"] >= 0
 
 
 def test_ingest_missing_logs_field_is_422(client):

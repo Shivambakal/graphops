@@ -45,6 +45,8 @@ EXPECTED_SCENARIO_IDS = {
     "impossible-travel-login",
     "privesc-path-chain",
     "insider-bulk-download",
+    "token-replay-finance-ledger",  # added 2026-10-08 (backend hardening)
+    "c2-beaconing-to-exfil",        # added 2026-10-08 (backend hardening)
 }
 
 
@@ -235,7 +237,7 @@ def test_redteam_scenarios_endpoint(client):
     r = client.get("/redteam/scenarios")
     assert r.status_code == 200
     body = r.json()
-    assert body["count"] == 5
+    assert body["count"] == len(body["scenarios"]) == len(EXPECTED_SCENARIO_IDS)
     assert {s["id"] for s in body["scenarios"]} == EXPECTED_SCENARIO_IDS
     assert body["synthetic"] is True
 

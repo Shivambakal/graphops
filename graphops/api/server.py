@@ -8,16 +8,23 @@ All sibling imports are wrapped in try/except with duck-typed fallbacks.
 """
 
 import sys
+import time
 import traceback
 from pathlib import Path
+from typing import Literal, Optional
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Query, Request
+from pydantic import BaseModel, Field, field_validator
 
 # Make the build dir importable so sibling graphops.* modules resolve.
 _BUILD_DIR = Path(__file__).resolve().parents[2]
 if str(_BUILD_DIR) not in sys.path:
     sys.path.insert(0, str(_BUILD_DIR))
+
+try:
+    from graphops.api import ratelimit as _ratelimit
+except Exception:  # pragma: no cover
+    _ratelimit = None
 
 
 # ---------------------------------------------------------------------------
@@ -162,25 +169,37 @@ def _normalize_edges(engine):
 # Fallback containment (used only when graphops.response.contain is missing)
 # ---------------------------------------------------------------------------
 def _fallback_containment(engine, node_id):
+    # Same response SHAPE as graphops.response.contain.recommend_containment:
+    # blast_radius is a dict keyed by node id with distance +
+    # data_classification per node. (Used only if the contain module import
+    # fails; kept schema-identical so the frontend never has to branch.)
     edges = _normalize_edges(engine)
     adj = {}
     for e in edges:
         adj.setdefault(e["src"], []).append(e["dst"])
         adj.setdefault(e["dst"], []).append(e["src"])
     seen = {node_id}
+    dist = {node_id: 0}
     frontier = [node_id]
     while frontier:
-        cur = frontier.pop()
+        cur = frontier.pop(0)
+        if dist[cur] >= 4:  # same BFS depth as recommend_containment
+            continue
         for nb in adj.get(cur, []):
             if nb not in seen:
                 seen.add(nb)
+                dist[nb] = dist[cur] + 1
                 frontier.append(nb)
-    affected = sorted(seen - {node_id})
+    radius = {
+        n: {"distance": dist[n],
+            "data_classification": _node_classification(engine, n)}
+        for n in sorted(seen)  # seed included at distance 0, like the real one
+    }
+    affected = sorted(n for n in seen if n != node_id)
     return {
         "node_id": node_id,
-        "blast_radius": [{"id": n, "data_classification":
-                          _node_classification(engine, n)} for n in affected],
-        "blast_radius_size": len(affected),
+        "blast_radius": radius,
+        "blast_radius_size": len(radius),
         "actions": [
             {"action": "isolate_host", "target": node_id, "priority": "P1",
              "detail": "Quarantine the node from the network immediately."},
@@ -248,7 +267,7 @@ except Exception:
 
 
 class BlastRadiusRequest(BaseModel):
-    node_id: str
+    node_id: str = Field(min_length=1, max_length=256)
 
 
 @app.get("/health")
@@ -287,7 +306,8 @@ MAX_FINDINGS_TOTAL = 500
 
 
 @app.post("/hunt")
-def hunt(max_findings: int = MAX_FINDINGS_TOTAL):
+def hunt(max_findings: int = Query(default=MAX_FINDINGS_TOTAL, ge=1,
+                                   le=1000)):
     queries = []
     try:
         from graphops.hunt.queries import (
@@ -339,6 +359,12 @@ def hunt_privilege_escalation():
             findings.extend(res if isinstance(res, list) else [res])
     except Exception:
         traceback.print_exc()
+    # same evidence-chain contract as /hunt: every finding ships one
+    try:
+        from graphops.hunt.evidence import attach_evidence_chains
+        findings = attach_evidence_chains(engine, findings)
+    except Exception:
+        traceback.print_exc()
     return {"findings": findings}
 
 
@@ -350,6 +376,12 @@ def hunt_data_staging():
         res = _h(engine)
         if res:
             findings.extend(res if isinstance(res, list) else [res])
+    except Exception:
+        traceback.print_exc()
+    # same evidence-chain contract as /hunt: every finding ships one
+    try:
+        from graphops.hunt.evidence import attach_evidence_chains
+        findings = attach_evidence_chains(engine, findings)
     except Exception:
         traceback.print_exc()
     return {"findings": findings}
@@ -400,6 +432,30 @@ def redteam_run_scenario(scenario_id: str, seed: int = 42):
         raise HTTPException(status_code=404,
                             detail=f"unknown scenario {scenario_id!r}")
     return run_scenario(scenario_id, seed=int(seed))
+
+
+# Cross-scenario metrics rollup: per-hunt-method MTTD + firings plus the
+# per-scenario coverage/precision/recall table. Deterministic; cached for
+# METRICS_TTL_S so the 7-scenario replay (~4 s) is not paid per request.
+_METRICS_CACHE: dict = {"at": 0.0, "seed": None, "payload": None}
+METRICS_TTL_S = 300.0
+
+
+@app.get("/redteam/metrics")
+def redteam_metrics(seed: int = Query(default=42, ge=0, le=10 ** 9)):
+    now = time.time()
+    cached = _METRICS_CACHE
+    if (cached["payload"] is not None and cached["seed"] == seed
+            and now - cached["at"] < METRICS_TTL_S):
+        return cached["payload"]
+    try:
+        from graphops.redteam.scenarios import rollup_metrics
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="metrics unavailable")
+    payload = rollup_metrics(seed=seed)
+    cached.update(at=now, seed=seed, payload=payload)
+    return payload
 
 
 @app.post("/blast-radius")
@@ -455,17 +511,37 @@ def record_decision(req: DecisionRequest):
         raise HTTPException(status_code=500, detail="decision store unavailable")
     record, store = record_analyst_decision(
         req.node_id, req.action, req.target, req.decision, req.rationale)
+    # the queue is the pending work list: a decided action leaves it.
+    # resolution failure must never break the audit write above.
+    try:
+        from graphops.response.gate import resolve_queued_action
+        resolve_queued_action(req.node_id, req.action, req.target,
+                              req.decision)
+    except Exception:
+        traceback.print_exc()
     return {"ok": True, "id": record.get("id"), "stored": True,
             "persistence": store}
 
 
 @app.get("/decisions")
-def list_decisions(limit: int = 50):
+def list_decisions(
+        limit: int = Query(default=50, ge=1, le=200),
+        status: Optional[str] = Query(default=None, max_length=64),
+        action: Optional[str] = Query(default=None, max_length=64),
+        min_reversibility: Optional[float] = Query(default=None, ge=0.0,
+                                                  le=1.0),
+        sort: str = Query(default="newest", pattern="^(newest|oldest)$")):
+    """Analyst decision audit trail + approval queue, filterable.
+
+    Filters: ``status`` (decisions: approved|rejected; queue:
+    queued_for_approval), ``action`` (exact action name),
+    ``min_reversibility`` (queue records only), ``sort`` newest|oldest.
+    """
+    lim = min(max(limit, 1), 200)
     items, store = [], "local"
     try:
         from graphops.response.gate import list_analyst_decisions
-        items, store = list_analyst_decisions(
-            limit=min(max(limit, 1), 200))
+        items, store = list_analyst_decisions(limit=lim)
     except Exception:
         traceback.print_exc()
     # Approval queue: irreversible actions waiting on an analyst, enriched
@@ -473,9 +549,35 @@ def list_decisions(limit: int = 50):
     queue = []
     try:
         from graphops.response.gate import list_queued
-        queue = list_queued(limit=min(max(limit, 1), 200))
+        queue = list_queued(limit=lim)
     except Exception:
         traceback.print_exc()
+
+    def _matches_decision(d):
+        if status is not None and d.get("decision") != status:
+            return False
+        if action is not None and d.get("action") != action:
+            return False
+        return True
+
+    def _matches_queue(q):
+        if status is not None and q.get("status") != status:
+            return False
+        if action is not None and q.get("action") != action:
+            return False
+        if min_reversibility is not None:
+            try:
+                if float(q.get("reversibility_score", 0.0)) < min_reversibility:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
+
+    items = [d for d in items if _matches_decision(d)]
+    queue = [q for q in queue if _matches_queue(q)]
+    if sort == "oldest":
+        items.reverse()
+        queue.reverse()
     return {"decisions": items, "queue": queue,
             "persisted": store == "supabase",
             "persistence": store,
@@ -488,15 +590,45 @@ def list_decisions(limit: int = 50):
 # as recommendations; irreversible ones are queued behind analyst approval.
 # ---------------------------------------------------------------------------
 class ContainRequest(BaseModel):
-    node_id: str
-    action: str
-    target: str = ""
-    context: dict = {}
-    requested_by: str = "analyst"
+    node_id: str = Field(min_length=1, max_length=256)
+    action: str = Field(min_length=1, max_length=64)
+    target: str = Field(default="", max_length=256)
+    context: dict = Field(default_factory=dict)
+    requested_by: str = Field(default="analyst", min_length=1, max_length=64)
+
+    @field_validator("context")
+    @classmethod
+    def _cap_context(cls, v):
+        if len(v) > 50:
+            raise ValueError("context: at most 50 keys")
+        for k, val in v.items():
+            if len(str(val)) > 2048:
+                raise ValueError(f"context[{k!r}]: value too large")
+        return v
+
+
+def _client_ip(request: Request) -> str:
+    try:
+        return request.client.host if request.client else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _enforce_rate_limit(request: Request, route: str) -> None:
+    if _ratelimit is None:
+        return
+    allowed, retry_after = _ratelimit.check(route, _client_ip(request))
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"rate limit exceeded for /{route}; retry in "
+                   f"{int(retry_after)}s",
+            headers={"Retry-After": str(int(retry_after))})
 
 
 @app.post("/contain")
-def propose_containment(req: ContainRequest):
+def propose_containment(req: ContainRequest, request: Request):
+    _enforce_rate_limit(request, "contain")
     try:
         from graphops.response.gate import evaluate_action, queue_action
     except Exception:
@@ -549,12 +681,13 @@ _INGESTED_META = {}
 
 
 class IngestRequest(BaseModel):
-    logs: str  # raw CSV or JSON text
-    format: str = "auto"  # csv | json | auto
+    logs: str = Field(min_length=1, max_length=5_000_000)  # 5 MB cap
+    format: Literal["csv", "json", "auto"] = "auto"
 
 
 @app.post("/ingest")
-def ingest_logs(req: IngestRequest):
+def ingest_logs(req: IngestRequest, request: Request):
+    _enforce_rate_limit(request, "ingest")
     global _INGESTED_GRAPH, _INGESTED_META
     try:
         from graphops.engine.parser import ingest as _ingest, build_graph as _build
@@ -597,7 +730,14 @@ def hunt_beaconing():
     G = _telemetry_graph()
     if G is None:
         raise HTTPException(status_code=400, detail="no graph: POST /ingest first")
-    return {"findings": _detect(G), "ingested": _INGESTED_GRAPH is not None}
+    findings = _detect(G)
+    # evidence-chain contract: every finding ships one, like /hunt
+    try:
+        from graphops.hunt.evidence import attach_evidence_chains
+        findings = attach_evidence_chains(G, findings)
+    except Exception:
+        traceback.print_exc()
+    return {"findings": findings, "ingested": _INGESTED_GRAPH is not None}
 
 
 @app.post("/hunt/lateral")
@@ -610,7 +750,14 @@ def hunt_lateral():
     G = _telemetry_graph()
     if G is None:
         raise HTTPException(status_code=400, detail="no graph: POST /ingest first")
-    return {"findings": _hunt(G), "ingested": _INGESTED_GRAPH is not None}
+    findings = _hunt(G)
+    # evidence-chain contract: every finding ships one, like /hunt
+    try:
+        from graphops.hunt.evidence import attach_evidence_chains
+        findings = attach_evidence_chains(G, findings)
+    except Exception:
+        traceback.print_exc()
+    return {"findings": findings, "ingested": _INGESTED_GRAPH is not None}
 
 
 class PrivilegePathRequest(BaseModel):

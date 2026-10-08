@@ -141,7 +141,12 @@ code { font-family: var(--mono); font-size: 0.85em; color: var(--cyan); }
 
 /* ---------- canvas ---------- */
 .canvas-wrap {
-  position: relative; flex: 1; min-height: 480px; border-radius: 10px; overflow: hidden;
+  /* BUGFIX 2026-10-08: the wrap used to stretch with async side-panel content
+   * (queue/scenarios/blast), which (a) left the canvas backing store stale ->
+   * vertically stretched rendering + broken hit-testing, and (b) forced
+   * fragile node-position rescaling. The viewport is now a stable height; the
+   * buffer syncs to it and node coordinates never need rescaling. */
+  position: relative; flex: none; height: clamp(480px, 62vh, 900px); border-radius: 10px; overflow: hidden;
   border: 1px solid var(--line);
   background:
     linear-gradient(rgba(34,211,238,0.035) 1px, transparent 1px),
@@ -174,6 +179,17 @@ code { font-family: var(--mono); font-size: 0.85em; color: var(--cyan); }
   border-radius: 7px; padding: 9px 11px; margin-bottom: 12px; line-height: 1.5;
 }
 .blast-table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
+/* BUGFIX 2026-10-08: a 300+ row blast radius stretched the whole dashboard
+ * grid to ~10k px, breaking canvas hit-testing for below-fold clicks. The
+ * table now scrolls internally with a sticky header. */
+.blast-table-wrap {
+  max-height: 380px; overflow-y: auto; border: 1px solid var(--line);
+  border-radius: 8px; margin: 4px 0 6px;
+  scrollbar-width: thin; scrollbar-color: var(--line) transparent;
+}
+.blast-table-wrap::-webkit-scrollbar { width: 6px; }
+.blast-table-wrap::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
+.blast-table thead th { position: sticky; top: 0; background: #0a1120; z-index: 1; }
 .blast-table th {
   text-align: left; font-size: 10.5px; text-transform: uppercase; letter-spacing: 1px;
   color: var(--muted); padding: 7px 8px; border-bottom: 1px solid var(--line);
@@ -638,3 +654,146 @@ code { font-family: var(--mono); font-size: 0.85em; color: var(--cyan); }
 .stage.miss .stage-dot { background: var(--red); box-shadow: 0 0 8px var(--red); }
 .stage.miss .stage-name { color: #fca5a5; }
 .stage-delay { color: var(--muted); font-size: 10.5px; }
+
+/* ============ FRONTEND AGENT 2026-10-08 — method metrics, approval queue,
+   run history + trend + comparison, shortcuts help, a11y pass ============ */
+
+/* --- accessibility: visible focus everywhere, esp. new panels --- */
+.btn:focus-visible, select:focus-visible, input:focus-visible,
+.node-chip:focus-visible, .path-node:focus-visible, .pal-item:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
+  box-shadow: 0 0 12px rgba(34,211,238,0.4);
+}
+/* new-panel key numbers use full-contrast text, never muted-on-dark alone */
+.qsum-num, .mm-count b, .sm-num, .cmp-table td { color: var(--txt); }
+
+/* --- per-method hunt metrics --- */
+.metrics-panel { margin-top: 16px; }
+.mm-row {
+  border: 1px solid var(--line); border-radius: 10px;
+  padding: 9px 11px; margin-bottom: 8px; background: rgba(0,0,0,0.22);
+}
+.mm-top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.mm-method { font-family: var(--mono); font-size: 12px; color: var(--cyan); }
+.mm-count { font-size: 12px; color: var(--txt); white-space: nowrap; }
+.sevbar-track {
+  display: flex; height: 5px; border-radius: 3px; overflow: hidden;
+  background: rgba(28,39,64,0.8); margin-top: 7px;
+}
+.sevbar { display: block; height: 100%; }
+.sevbar.sev-critical { background: var(--red); }
+.sevbar.sev-high { background: #fb923c; }
+.sevbar.sev-medium { background: var(--amber); }
+.sevbar.sev-low { background: var(--blue); }
+.sevbar.sev-info { background: #64748b; }
+.mm-enrich { margin-top: 6px; }
+.mm-enrich b { color: var(--txt); }
+.mm-note { margin-top: 8px; line-height: 1.5; }
+
+/* --- approval queue --- */
+.queue-depth { font-size: 11.5px; color: var(--muted); font-family: var(--mono); }
+.queue-depth.hot { color: var(--amber); font-weight: 700; }
+.queue-summary { margin-bottom: 10px; }
+.qsum {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;
+  border: 1px solid var(--line); border-radius: 10px;
+  padding: 10px 12px; background: rgba(34,211,238,0.04);
+}
+.qsum-cell { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.qsum-num { font-size: 17px; font-weight: 700; font-family: var(--mono); }
+.qsum-label { font-size: 10.5px; color: var(--muted); }
+.qsum-tiers-row { display: flex; gap: 5px; flex-wrap: wrap; }
+.tier {
+  font-size: 10.5px; font-family: var(--mono); font-weight: 700;
+  padding: 2px 8px; border-radius: 10px; border: 1px solid;
+}
+.tier-high { color: #fca5a5; border-color: rgba(248,113,113,0.6); background: rgba(248,113,113,0.1); }
+.tier-medium { color: #fde68a; border-color: rgba(251,191,36,0.6); background: rgba(251,191,36,0.1); }
+.tier-low { color: var(--green); border-color: rgba(52,211,153,0.6); background: rgba(52,211,153,0.1); }
+.tier-unknown { color: var(--muted); border-color: var(--line); background: rgba(0,0,0,0.2); }
+.queue-list {
+  display: flex; flex-direction: column; gap: 9px; margin-top: 4px;
+  max-height: 430px; overflow-y: auto; padding-right: 4px;
+  scrollbar-width: thin; scrollbar-color: var(--line) transparent;
+}
+.queue-list::-webkit-scrollbar { width: 6px; }
+.queue-list::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
+.qrow {
+  border: 1px solid var(--line); border-radius: 10px;
+  padding: 10px 12px; background: rgba(0,0,0,0.22);
+}
+.qrow-main { display: flex; gap: 10px; align-items: flex-start; }
+.qrow-meta { margin-top: 4px; }
+.qstatus { color: var(--amber); }
+.qrow-cost { display: flex; align-items: center; gap: 10px; margin-top: 7px; }
+.revtrack {
+  display: inline-block; width: 110px; height: 5px; border-radius: 3px;
+  background: rgba(28,39,64,0.9); overflow: hidden;
+}
+.revtrack i { display: block; height: 100%; background: linear-gradient(90deg, var(--red), var(--amber), var(--green)); }
+.qcost { font-size: 12px; font-family: var(--mono); color: var(--txt); }
+.qrow-foot { display: flex; align-items: center; gap: 9px; margin-top: 9px; flex-wrap: wrap; }
+.btn.decide.sm { font-size: 11.5px; padding: 4px 10px; }
+
+/* --- run history, trend, comparison --- */
+.run-history {
+  margin-top: 4px; max-height: 420px; overflow-y: auto; padding-right: 4px;
+  scrollbar-width: thin; scrollbar-color: var(--line) transparent;
+}
+.run-history::-webkit-scrollbar { width: 6px; }
+.run-history::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
+.hist-trend {
+  border: 1px solid var(--line); border-radius: 10px;
+  padding: 10px 12px; margin-bottom: 10px; background: rgba(167,139,250,0.04);
+}
+.hist-trend-head { margin-bottom: 6px; }
+.hist-trend-head b { color: var(--txt); }
+.trend-legend { display: flex; gap: 12px; margin-top: 4px; align-items: center; }
+.trend-swatch { display: inline-block; width: 10px; height: 3px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+.hist-row {
+  display: flex; gap: 10px; align-items: flex-start;
+  border: 1px solid var(--line); border-radius: 10px;
+  padding: 8px 11px; margin-bottom: 7px; background: rgba(0,0,0,0.22);
+}
+.hist-row.sel { border-color: rgba(34,211,238,0.55); box-shadow: 0 0 10px rgba(34,211,238,0.15); }
+.hist-cmp { padding-top: 3px; }
+.hist-cmp input { width: 15px; height: 15px; accent-color: var(--cyan); cursor: pointer; }
+.hist-main { flex: 1; min-width: 0; }
+.hist-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.hist-top b { font-size: 12.5px; }
+.hist-meta { margin-top: 4px; }
+.hist-meta b { color: var(--txt); }
+.hist-foot { display: flex; align-items: center; gap: 10px; margin: 8px 0; }
+.cmp-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 4px; }
+.cmp-table th, .cmp-table td {
+  border: 1px solid var(--line); padding: 6px 9px; text-align: left;
+}
+.cmp-table th { background: rgba(0,0,0,0.3); color: var(--muted); font-weight: 600; }
+.cmp-table td.cmp-win { color: var(--green); font-weight: 700; }
+.hist-compare { margin-top: 6px; }
+
+/* --- shortcuts help overlay --- */
+.shortcuts-overlay {
+  position: fixed; inset: 0; z-index: 100;
+  background: rgba(3,6,12,0.72); backdrop-filter: blur(3px);
+  display: flex; align-items: center; justify-content: center;
+}
+.shortcuts-overlay[hidden] { display: none; }
+.shortcuts-box {
+  width: min(480px, 92vw); max-height: 84vh; overflow-y: auto;
+  background: var(--bg2); border: 1px solid var(--line); border-radius: 14px;
+  padding: 20px 22px; box-shadow: 0 24px 80px rgba(0,0,0,0.6);
+}
+.shortcuts-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.shortcuts-head h2 { margin: 0; font-size: 16px; }
+.shortcuts-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.shortcuts-table td { padding: 6px 8px; border-bottom: 1px solid var(--line); }
+.shortcuts-table td:first-child { width: 130px; }
+.shortcuts-table code {
+  background: rgba(34,211,238,0.1); border: 1px solid rgba(34,211,238,0.35);
+  border-radius: 5px; padding: 1px 7px; color: var(--cyan);
+}
+
+/* --- DPDP card: 3 metric cells now --- */
+.dpdp-metrics { grid-template-columns: 1fr 1fr 1fr; }

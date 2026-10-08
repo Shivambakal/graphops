@@ -183,6 +183,47 @@ SCENARIOS: List[Dict[str, Any]] = [
             ("bulk-exfil", 16200, ["host:ws-031", "ip:203.0.113.9"]),
         ],
     },
+    {
+        "id": "token-replay-finance-ledger",
+        "name": "Token Replay -> Finance Ledger",
+        "description": (
+            "The stolen Slack session token is replayed outside its home "
+            "app; its over-scoped admin grant unlocks the DPDP-regulated "
+            "finance-ledger dataset (wire-fraud angle). Detection is "
+            "immediate because the misconfiguration is visible from t=0."
+        ),
+        "campaign": _CAMPAIGN,
+        "seed_node": "oauth_token:tok-campaign-01",
+        "stages": [
+            ("session-token-replay", 0,
+             ["user:u-0042", "oauth_token:tok-campaign-01"]),
+            ("privileged-scope-active", 600,
+             ["oauth_token:tok-campaign-01",
+              "oauth_scope:admin:users:write"]),
+            ("finance-ledger-reached", 1200,
+             ["oauth_scope:admin:users:write", "dataset:finance-ledger"]),
+        ],
+    },
+    {
+        "id": "c2-beaconing-to-exfil",
+        "name": "C2 Beaconing -> Exfiltration",
+        "description": (
+            "After 7z staging on the admin host, a beaconing C2 channel to "
+            "an external IP carries the archives out. Beaconing and "
+            "data-staging hunts corroborate the same host<->IP pair, so the "
+            "channel is detected as it goes live."
+        ),
+        "campaign": _CAMPAIGN,
+        "seed_node": "host:ws-031",
+        "stages": [
+            ("staging-for-beacon-exfil", 14400,
+             ["host:ws-031", "process:7z.exe"]),
+            ("beacon-channel-established", 16200,
+             ["host:ws-031", "ip:203.0.113.9"]),
+            ("exfil-burst-over-beacon", 18000,
+             ["host:ws-031", "ip:203.0.113.9"]),
+        ],
+    },
 ]
 
 
@@ -333,6 +374,105 @@ def run_scenario(scenario_id: str, seed: int = 42) -> Dict[str, Any]:
         "blast_radius": _blast_radius_metrics(
             engine, scenario["seed_node"], truth_nodes),
         "replay_ms": int((time.time() - started) * 1000),
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
+def rollup_metrics(seed: int = 42) -> Dict[str, Any]:
+    """Cross-scenario metrics rollup for the demo scoreboard.
+
+    Runs every scenario (deterministic, same seed) and aggregates:
+
+    - per_method[hunt]: total firings, scenarios with >=1 detection
+      attributed to that hunt, and mean detection delay over stages
+      attributed to it (per-method MTTD).
+    - per_scenario[id]: coverage, mttd_seconds, mttc_seconds,
+      blast_radius precision/recall.
+    - totals: scenario count, mean coverage, mean precision/recall
+      (over scenarios where the radius is non-empty).
+
+    Every number is computed from the replays; nothing is invented.
+    """
+    started = time.time()
+    method_names = [name for name, _ in _DEFAULT_HUNTS]
+    per_method: Dict[str, Dict[str, Any]] = {
+        name: {"firings_total": 0, "scenarios_detected": 0,
+               "stages_detected": 0, "_delay_sum": 0.0}
+        for name in method_names
+    }
+    per_scenario: Dict[str, Dict[str, Any]] = {}
+    coverages: List[float] = []
+    precisions: List[float] = []
+    recalls: List[float] = []
+
+    for scenario in SCENARIOS:
+        rep = run_scenario(scenario["id"], seed=seed)
+        total = len(rep["stages"])
+        coverages.append(rep["detected"] / total if total else 0.0)
+        br = rep["blast_radius"]
+        if br.get("precision") is not None:
+            precisions.append(br["precision"])
+        if br.get("recall") is not None:
+            recalls.append(br["recall"])
+        per_scenario[rep["id"]] = {
+            "name": rep["name"],
+            "coverage": rep["coverage"],
+            "detected": rep["detected"],
+            "missed": rep["missed"],
+            "mttd_seconds": rep["mttd_seconds"],
+            "mttc_seconds": rep["mttc_seconds"],
+            "blast_precision": br.get("precision"),
+            "blast_recall": br.get("recall"),
+            "detections_fired_total": rep["detections_fired_total"],
+        }
+        for name in method_names:
+            per_method[name]["firings_total"] += \
+                rep["detections_fired"].get(name, 0)
+        seen_method = {name: False for name in method_names}
+        for st in rep["stages"]:
+            if st["status"] != "detected":
+                continue
+            for name in st.get("detected_by", []):
+                if name in per_method:
+                    per_method[name]["stages_detected"] += 1
+                    seen_method[name] = True
+                    if st["detection_delay_s"] is not None:
+                        per_method[name]["_delay_sum"] += \
+                            st["detection_delay_s"]
+        for name, seen in seen_method.items():
+            if seen:
+                per_method[name]["scenarios_detected"] += 1
+
+    methods: Dict[str, Dict[str, Any]] = {}
+    for name, m in per_method.items():
+        sd = m["stages_detected"]
+        methods[name] = {
+            "firings_total": m["firings_total"],
+            "scenarios_detected": m["scenarios_detected"],
+            "stages_detected": sd,
+            "mean_detection_delay_s": (
+                round(m["_delay_sum"] / sd, 1) if sd else None),
+        }
+
+    def _mean(xs: List[float]) -> Optional[float]:
+        return round(sum(xs) / len(xs), 3) if xs else None
+
+    return {
+        "seed": seed,
+        "synthetic": True,
+        "scenario_count": len(SCENARIOS),
+        "mttc_model": ("mean(detection_delay_s) + analyst_response_sla_seconds "
+                       "(synthetic planning estimate; containment is "
+                       "recommendations-only and never auto-executes)"),
+        "analyst_response_sla_seconds": ANALYST_RESPONSE_SLA_S,
+        "per_method": methods,
+        "per_scenario": per_scenario,
+        "totals": {
+            "mean_coverage": _mean(coverages),
+            "mean_blast_precision": _mean(precisions),
+            "mean_blast_recall": _mean(recalls),
+        },
+        "computed_ms": int((time.time() - started) * 1000),
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 

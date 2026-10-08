@@ -141,8 +141,8 @@ const UI = (() => {
     const cmds = [
       { title: 'Run hunt', hint: 'POST /hunt · H', run: () => ops.runHunt && ops.runHunt({}) },
       { title: 'Run demo attack scenario', hint: 'hunt + highlight · D', run: () => ops.runDemo && ops.runDemo() },
-      { title: 'Open red-team replay panel', hint: 'demo scenarios · metrics · copy demo script',
-        run: () => { const r = document.getElementById('replay'); if (r) r.scrollIntoView({ behavior: 'smooth', block: 'start' }); } },
+      { title: 'Open red-team replay panel', hint: 'demo scenarios · metrics · copy demo script · R',
+        run: () => ops.scrollToReplay && ops.scrollToReplay() },
       { title: 'Blast-radius camera tour (3D)', hint: 'cinematic path · T', run: () => ops.tourBlastView && ops.tourBlastView() },
       { title: 'Toggle node coloring: entity type ↔ data classification', hint: 'X', run: () => ops.toggleColorMode && ops.toggleColorMode() },
       { title: 'Retry API connection', hint: 'restore offline dashboard', run: () => ops.retryConnection && ops.retryConnection() },
@@ -152,7 +152,11 @@ const UI = (() => {
           const fs = ops.getFindings ? ops.getFindings() : [];
           if (fs.length && ops.openEvidence) ops.openEvidence(fs[0]);
         } },
-      { title: mode === '2d' ? 'Switch to 3D graph' : 'Switch to 2D graph', hint: 'toggle view', run: () => setView(mode === '2d' ? '3d' : '2d') },
+      { title: mode === '2d' ? 'Switch to 3D graph' : 'Switch to 2D graph', hint: 'toggle view · G', run: () => setView(mode === '2d' ? '3d' : '2d') },
+      { title: 'Go to approval queue', hint: 'refresh queued actions · A', run: () => ops.scrollToQueue && ops.scrollToQueue() },
+      { title: 'Refresh approval queue', hint: 'reload GET /decisions queue', run: () => ops.refreshQueue && ops.refreshQueue() },
+      { title: 'Clear red-team run history', hint: 'this browser\u2019s records', run: () => ops.clearRunHistory && ops.clearRunHistory() },
+      { title: 'Keyboard shortcuts', hint: '? — full cheat sheet', run: () => ops.openShortcuts && ops.openShortcuts() },
       { title: 'Clear highlights', hint: 'attack path + blast · C', run: () => { ops.clearHighlights && ops.clearHighlights(); ops.closeDrawer && ops.closeDrawer(); } },
     ];
     const findings = ops.getFindings ? ops.getFindings() : [];
@@ -253,7 +257,11 @@ const UI = (() => {
       else if (k === 'd') { ops.runDemo && ops.runDemo(); }
       else if (k === 't') { ops.tourBlastView && ops.tourBlastView(); }
       else if (k === 'x') { ops.toggleColorMode && ops.toggleColorMode(); }
+      else if (k === 'g') { setView(mode === '2d' ? '3d' : '2d'); }
+      else if (k === 'r') { ops.scrollToReplay && ops.scrollToReplay(); }
+      else if (k === 'a') { ops.scrollToQueue && ops.scrollToQueue(); }
       else if (k === 'c') { ops.clearHighlights && ops.clearHighlights(); if (ops.closeDrawer) ops.closeDrawer(); }
+      else if (k === '?') { ops.openShortcuts && ops.openShortcuts(); }
       else if (k === 'e') {
         const fs = ops.getFindings ? ops.getFindings() : [];
         if (fs.length && ops.openEvidence) ops.openEvidence(fs[0]);
@@ -268,11 +276,23 @@ const UI = (() => {
     if (b3) b3.addEventListener('click', () => setView('3d'));
   }
 
+  function wireShortcutsOverlay() {
+    const ov = $('shortcutsOverlay'), close = $('btnShortcutsClose');
+    if (!ov) return;
+    const shut = () => { if (window.GraphOps) window.GraphOps.closeShortcuts(); };
+    if (close) close.addEventListener('click', shut);
+    ov.addEventListener('click', (ev) => { if (ev.target === ov) shut(); });
+    document.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape' && !ov.hidden) shut();
+    });
+  }
+
   window.addEventListener('DOMContentLoaded', () => {
     entrance();
     wirePalette();
     wireShortcuts();
     wireToggle();
+    wireShortcutsOverlay();
   });
 
   return { bootDone, countUp, animateFindings, blastPulse, setView, getMode, openPalette };

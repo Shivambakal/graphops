@@ -174,6 +174,14 @@ def _iter_nodes(engine):
     g = getattr(engine, "graph", None)
     if g is None:
         return
+    # DPDP overlay: keep the graph layer's classification attribute in sync
+    # with what the API serves (graphops.graph.classification). Computed,
+    # never raises; skipped silently if the classifier is unavailable.
+    try:
+        from graphops.graph.classification import (
+            classify_node as _classify_node)
+    except Exception:
+        _classify_node = None  # type: ignore[assignment]
     try:
         items = list(g.nodes(data=True))
     except Exception:
@@ -182,6 +190,11 @@ def _iter_nodes(engine):
         attrs = attrs if isinstance(attrs, dict) else {}
         etype = str(attrs.get("etype", "unknown"))
         props = {k: _scalar(v) for k, v in attrs.items() if k != "etype"}
+        if _classify_node is not None and "data_classification" not in props:
+            try:
+                props["data_classification"] = _classify_node(engine, str(nid))
+            except Exception:
+                pass
         yield {"id": str(nid), "etype": etype, "props": props}
 
 

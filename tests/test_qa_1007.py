@@ -254,14 +254,16 @@ def test_redteam_replay_endpoint_shape(client):
 
 
 def test_redteam_scenarios_catalog_shape(client):
-    # GET /redteam/scenarios is the catalog (no metrics keys by design);
-    # per-scenario metrics live at POST /redteam/run/{id}.
+    # Catalog grew on 2026-10-08 (backend: +2 scenarios). Contract now:
+    # count matches the listed scenarios, every scenario has id + name,
+    # everything is labeled synthetic.
     r = client.get("/redteam/scenarios")
     assert r.status_code == 200
     body = r.json()
-    assert body["count"] == 5
-    assert len(body["scenarios"]) == 5
+    assert body["count"] == len(body["scenarios"]) >= 5
     assert body["synthetic"] is True
+    for s in body["scenarios"]:
+        assert s.get("id") and s.get("name"), s
 
 
 def test_redteam_run_endpoint_returns_metrics(client):
@@ -277,6 +279,12 @@ def test_redteam_run_unknown_scenario_is_404(client):
     assert client.post("/redteam/run/nope").status_code == 404
 
 
-def test_redteam_metrics_path_still_unbuilt(client):
-    # GET /redteam/metrics was never built: 404 proves it, no silent 200.
-    assert client.get("/redteam/metrics").status_code == 404
+def test_redteam_metrics_endpoint_built_2026_10_08(client):
+    # GET /redteam/metrics was built on 2026-10-08 (aggregate detection
+    # metrics across all scenarios): 200 with per-method stats, not 404.
+    r = client.get("/redteam/metrics")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["synthetic"] is True
+    assert body["scenario_count"] == body.get("scenario_count", 0) >= 5
+    assert isinstance(body.get("per_method"), dict) and body["per_method"]

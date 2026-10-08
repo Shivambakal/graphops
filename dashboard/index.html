@@ -117,6 +117,14 @@
       <button id="btnNextPage" class="btn ghost sm">next →</button>
     </div>
     <div id="findingsList" class="findings"></div>
+
+    <!-- per-method hunt metrics (aggregated from real POST /hunt findings) -->
+    <div class="metrics-panel" id="methodMetrics" aria-label="Hunt method metrics">
+      <h3 class="actions-head">Method metrics <span id="metricsSrc" class="contract-src"></span></h3>
+      <div id="methodMetricsBody">
+        <p class="empty">No hunt run yet — per-method counts, severity split and share are computed from real <code>POST /hunt</code> findings once a hunt runs.</p>
+      </div>
+    </div>
   </aside>
 
   <!-- CENTER: graph canvas -->
@@ -151,7 +159,7 @@
         <span class="leg"><i class="dc-dot dc-regulated"></i>regulated ⚠</span>
       </div>
     </div>
-    <p class="hint muted small">2D: drag nodes · hover for detail · click a node for blast radius · title click → evidence chain &nbsp;|&nbsp; 3D: drag to orbit · scroll to zoom · click a node for blast radius &nbsp;|&nbsp; keys: <code>H</code> hunt · <code>D</code> demo · <code>E</code> evidence · <code>C</code> clear · <code>T</code> tour · <code>X</code> color · <code>⌘K</code> commands</p>
+    <p class="hint muted small">2D: drag nodes · hover for detail · click a node for blast radius · title click → evidence chain &nbsp;|&nbsp; 3D: drag to orbit · scroll to zoom · click a node for blast radius &nbsp;|&nbsp; keys: <code>H</code> hunt · <code>D</code> demo · <code>E</code> evidence · <code>C</code> clear · <code>T</code> tour · <code>X</code> color · <code>G</code> 2D/3D · <code>R</code> replay · <code>A</code> approval queue · <code>?</code> all shortcuts · <code>⌘K</code> commands</p>
   </section>
 
   <!-- RIGHT: blast radius -->
@@ -167,19 +175,32 @@
     <div id="blastEmpty" class="empty">Click any node (in findings or on the graph) to compute its blast radius via <code>POST /blast-radius</code>. External IP nodes in radius get an <b class="exfil-tag">EXFIL RISK</b> badge (suspected C2/exfil endpoint). Regulated-data nodes get a crimson halo — click one to jump to its DPDP notification scope.</div>
     <div id="blastResults" hidden>
       <div id="dpdpCard" class="dpdp" hidden></div>
+      <div class="blast-table-wrap">
       <table class="blast-table">
         <thead><tr><th>node</th><th>distance</th><th>risk</th></tr></thead>
         <tbody id="blastRows"></tbody>
       </table>
+      </div>
       <h3 class="actions-head">Containment actions</h3>
       <div id="actionsList" class="actions"></div>
     </div>
+
+    <h3 class="actions-head">Approval queue <span id="queueDepth" class="queue-depth" title="queued actions awaiting analyst approval (GET /health.queue_depth)"></span></h3>
+    <div id="queueSummary" class="queue-summary" aria-label="Queue cost and reversibility summary">
+      <p class="empty" style="padding:6px 2px">Loading the approval queue from <code>GET /decisions</code>…</p>
+    </div>
+    <div id="approvalQueue" class="queue-list" aria-live="polite" aria-label="Actions awaiting approval"></div>
 
     <h3 class="actions-head">Red-team replay</h3>
     <div id="replay" class="replay">
       <p id="scenarioStatus" class="muted small">Loading scripted scenarios from <code>GET /demo-scenarios</code>…</p>
       <div id="scenarioList" class="scenarios"></div>
       <div id="scenarioResult" class="scenario-result" hidden></div>
+    </div>
+
+    <h3 class="actions-head">Run history <span id="historyCount" class="muted small"></span></h3>
+    <div id="runHistory" class="run-history" aria-live="polite" aria-label="Recorded red-team runs">
+      <p class="empty" style="padding:6px 2px">No runs recorded yet in this browser — run a scenario above; each real run is timestamped and kept here for trend and comparison.</p>
     </div>
   </aside>
 </main>
@@ -203,6 +224,31 @@
   </div>
   <div id="drawerBody" class="drawer-body"></div>
 </aside>
+
+<!-- ============ KEYBOARD SHORTCUTS HELP ============ -->
+<div id="shortcutsOverlay" class="shortcuts-overlay" hidden role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+  <div class="shortcuts-box">
+    <div class="shortcuts-head">
+      <h2>Keyboard shortcuts</h2>
+      <button id="btnShortcutsClose" class="btn ghost" aria-label="Close shortcuts help">✕</button>
+    </div>
+    <table class="shortcuts-table">
+      <tr><td><code>H</code></td><td>Run hunt (POST /hunt)</td></tr>
+      <tr><td><code>D</code></td><td>Run demo attack scenario</td></tr>
+      <tr><td><code>E</code></td><td>Open evidence chain for the latest finding</td></tr>
+      <tr><td><code>C</code></td><td>Clear highlights + close drawer</td></tr>
+      <tr><td><code>T</code></td><td>Blast-radius camera tour (3D)</td></tr>
+      <tr><td><code>X</code></td><td>Toggle node coloring: entity type ↔ data classification</td></tr>
+      <tr><td><code>G</code></td><td>Toggle 2D / 3D graph view</td></tr>
+      <tr><td><code>R</code></td><td>Jump to red-team replay panel</td></tr>
+      <tr><td><code>A</code></td><td>Jump to approval queue (refreshes it)</td></tr>
+      <tr><td><code>?</code></td><td>This help overlay</td></tr>
+      <tr><td><code>⌘K</code> / <code>Ctrl+K</code></td><td>Command palette</td></tr>
+      <tr><td><code>Esc</code></td><td>Close palette / drawer / this overlay</td></tr>
+    </table>
+    <p class="muted small">Single-key shortcuts are ignored while typing in inputs. Every command here is also in the ⌘K palette.</p>
+  </div>
+</div>
 
 <!-- ============ COMMAND PALETTE ============ -->
 <div id="palette" class="palette" hidden>

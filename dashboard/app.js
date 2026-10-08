@@ -28,6 +28,8 @@ const EP_GRAPH = API_BASE + '/graph';
 const EP_DECISIONS = API_BASE + '/decisions';
 const EP_DEMO_SCENARIOS = API_BASE + '/demo-scenarios';
 const EP_DEMO_RUN = (id) => API_BASE + '/demo-scenarios/' + encodeURIComponent(id) + '/run';
+// optional per-method precision/recall/MTTD contract (backend may not ship it yet)
+const EP_METRICS = API_BASE + '/metrics';
 // new red-team contract (backend ships it alongside/after the demo contract)
 const EP_REDEAM_SCENARIOS = API_BASE + '/redteam/scenarios';
 const EP_REDEAM_RUN = (id) => API_BASE + '/redteam/run/' + encodeURIComponent(id);
@@ -81,6 +83,12 @@ const state = {
   // decision-audit persistence: null = unknown (GET /decisions unreachable),
   // true = persisted (Supabase store configured), false = in-memory only
   persisted: null, queuePersisted: null,
+  // approval queue (real GET /decisions.queue rows) + /health.queue_depth
+  queue: [], queueState: 'idle', queueDepth: null,
+  // per-method hunt metrics: aggregated from real findings + optional GET /metrics
+  metricsProbe: null, // null = not probed; {ok, methods: {...}} | {ok:false}
+  // red-team run history (this browser's real run records, localStorage)
+  history: [], historyCompare: [],
 };
 
 /* ================= dom ================= */
@@ -102,6 +110,10 @@ const el = {
   huntSeverity: $('huntSeverity'), huntMethod: $('huntMethod'), huntLimit: $('huntLimit'),
   pageBar: $('pageBar'), pageInfo: $('pageInfo'),
   btnPrevPage: $('btnPrevPage'), btnNextPage: $('btnNextPage'),
+  methodMetricsBody: $('methodMetricsBody'), metricsSrc: $('metricsSrc'),
+  queueDepth: $('queueDepth'), queueSummary: $('queueSummary'),
+  approvalQueue: $('approvalQueue'), runHistory: $('runHistory'),
+  historyCount: $('historyCount'),
   scenarioStatus: $('scenarioStatus'), scenarioList: $('scenarioList'),
   scenarioResult: $('scenarioResult'),
   btnRetryApi: $('btnRetryApi'), btnColorMode: $('btnColorMode'),
@@ -169,6 +181,11 @@ async function init() {
   if (footApi) footApi.textContent = API_BASE;
   sizeCanvas();
   window.addEventListener('resize', () => { sizeCanvas(); draw(); });
+  if (window.ResizeObserver) {
+    // the wrap grows as async content lands (queue, scenarios, blast rows) —
+    // keep the canvas buffer (and node coords) in sync, not just on window resize
+    new ResizeObserver(() => { syncCanvasSize(); draw(); }).observe(el.canvasWrap);
+  }
   wireCanvas();
   el.btnRunHunt.addEventListener('click', () => { state.hunt.offset = 0; runHunt(); });
   el.btnDemo.addEventListener('click', runDemoScenario);
@@ -179,6 +196,8 @@ async function init() {
   if (el.btnRetryApi) el.btnRetryApi.addEventListener('click', retryConnection);
   if (el.btnColorMode) el.btnColorMode.addEventListener('click', toggleColorMode);
   renderQueueEmpty(); // explicit pre-blast empty state for the containment queue
+  loadRunHistory(); // this browser's recorded red-team runs (localStorage)
+  renderRunHistory();
   document.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape' && !el.drawer.hidden) closeDrawer();
   });
@@ -190,6 +209,7 @@ async function init() {
   setAutoRefresh(true); // findings feed: live polling
   await loadGraph();
   await loadScenarios();
+  await loadApprovalQueue();
   if (window.UI) UI.bootDone();
 }
 
@@ -212,6 +232,10 @@ async function checkHealth() {
     const nodes = h.nodes ?? h.node_count ?? h.graph?.nodes ?? h.stats?.nodes;
     const edges = h.edges ?? h.edge_count ?? h.graph?.edges ?? h.stats?.edges;
     state.apiUp = true;
+    // contract: /health.queue_depth = actions awaiting analyst approval (all optional)
+    const qd = h.queue_depth ?? h.queueDepth ?? null;
+    state.queueDepth = (qd === null || qd === undefined) ? null : Number(qd);
+    renderQueueDepth();
     if (nodes !== undefined || edges !== undefined) {
       el.healthLine.innerHTML =
         `nodes <b>${esc(nodes ?? '?')}</b> · edges <b>${esc(edges ?? '?')}</b> · <span style="color:var(--green)">online</span>`;
@@ -237,6 +261,15 @@ function setOffline() {
   if (el.scenarioStatus) el.scenarioStatus.textContent = 'Red-team replay unavailable — API is offline.';
   if (el.btnBlastTour) el.btnBlastTour.hidden = true;
   if (autoTimer) { clearInterval(autoTimer); autoTimer = null; } // halt feed polling
+  state.queueDepth = null;
+  if (el.methodMetricsBody) el.methodMetricsBody.innerHTML =
+    '<p class="empty">Method metrics unavailable — the API is offline. Run a hunt once it is back.</p>';
+  if (el.metricsSrc) el.metricsSrc.textContent = '';
+  if (el.queueDepth) el.queueDepth.textContent = '';
+  if (el.queueSummary) el.queueSummary.innerHTML =
+    '<p class="empty" style="padding:6px 2px">Approval queue unavailable — API offline.</p>';
+  if (el.approvalQueue) el.approvalQueue.innerHTML =
+    '<p class="empty" style="padding:6px 2px">API offline — the queue cannot be loaded. Run history below is this browser\u2019s own record and stays visible.</p>';
 }
 function setOnline() {
   el.apiStatus.className = 'status-dot online';
@@ -260,6 +293,7 @@ async function retryConnection() {
   setAutoRefresh(true);
   await loadGraph();
   await loadScenarios();
+  await loadApprovalQueue();
   await runHunt({ silent: true });
   toast('API back online — graph, scenarios and feed restored', 'ok');
 }
@@ -423,8 +457,24 @@ function sizeCanvas() {
   ctx = c.getContext('2d');
 }
 
+/* BUGFIX 2026-10-08: the canvas backing store must match its CSS size.
+ * The wrap used to grow with async content while the buffer stayed at its
+ * load-time size -> vertically stretched rendering AND broken hit-testing
+ * (click CSS-px vs node coords in the old space). The wrap is now a stable
+ * height (see CSS), and this keeps the buffer in sync on window resizes too.
+ * Node positions are never rescaled: rescaling on resize proved fragile
+ * (racy with layout/rAF/scroll it could teleport nodes). */
+let lastWrapW = 0, lastWrapH = 0;
+function syncCanvasSize() {
+  const w = el.canvasWrap.clientWidth, h = el.canvasWrap.clientHeight;
+  if (!w || !h || (w === lastWrapW && h === lastWrapH)) return;
+  lastWrapW = w; lastWrapH = h;
+  sizeCanvas();
+}
+
 function draw() {
   if (!ctx) return;
+  syncCanvasSize(); // cheap guard: no-op when the wrap size is unchanged
   const W = el.canvasWrap.clientWidth, H = el.canvasWrap.clientHeight;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, W, H);
@@ -512,11 +562,24 @@ function wireCanvas() {
   };
 
   c.addEventListener('mousemove', (ev) => {
-    const p = pos(ev);
     if (state.dragged) {
-      state.dragged.x = p.x; state.dragged.y = p.y;
+      // BUGFIX 2026-10-08: drag via movement DELTAS, not absolute position.
+      // Absolute positioning reads getBoundingClientRect() fresh per event,
+      // so a page scroll in flight (e.g. the DPDP card's smooth scrollIntoView)
+      // teleports the dragged node. Deltas are scroll-immune and also preserve
+      // the grab offset instead of snapping the node center to the cursor.
+      const d = state.dragged;
+      if (typeof ev.movementX === 'number' && (ev.movementX || ev.movementY)) {
+        d.x += ev.movementX; d.y += ev.movementY;
+      } else if (typeof ev.movementX !== 'number') {
+        const p = pos(ev); d.x = p.x; d.y = p.y; // ancient browser fallback
+      }
+      const w = el.canvasWrap.clientWidth, h = el.canvasWrap.clientHeight;
+      d.x = Math.max(24, Math.min(w - 24, d.x));
+      d.y = Math.max(24, Math.min(h - 24, d.y));
       draw(); return;
     }
+    const p = pos(ev);
     const n = nearest(p);
     state.hovered = n;
     if (n) {
@@ -540,9 +603,12 @@ function wireCanvas() {
   c.addEventListener('mousedown', (ev) => {
     const n = nearest(pos(ev));
     if (n) state.dragged = n;
-  });
+    state.downXY = [ev.clientX, ev.clientY]; // BUGFIX 2026-10-08: drags fired
+  });                                        // blast-radius; only a real click may
   window.addEventListener('mouseup', () => { state.dragged = null; });
   c.addEventListener('click', (ev) => {
+    const d = state.downXY; state.downXY = null;
+    if (d && Math.hypot(ev.clientX - d[0], ev.clientY - d[1]) > 6) return; // it was a drag
     const n = nearest(pos(ev));
     if (n) handleNodeClick(n.id);
   });
@@ -657,6 +723,15 @@ async function runHunt({ silent = false } = {}) {
  * so a value is always valid to send. */
 function populateMethodOptions(raw) {
   if (!el.huntMethod) return;
+  // BUGFIX 2026-10-08: dynamic options accumulated on every hunt run
+  // (duplicates stacked in the dropdown). Rebuild from scratch each time —
+  // keep the static "method: all" option, drop all previously added ones.
+  const keep = [];
+  for (const o of el.huntMethod.options) {
+    if (!o.dataset || o.dataset.method !== '1') keep.push(o);
+  }
+  el.huntMethod.innerHTML = '';
+  for (const o of keep) el.huntMethod.appendChild(o);
   const seen = new Set();
   for (const x of raw) {
     const m = findingMethod(x);
@@ -664,11 +739,17 @@ function populateMethodOptions(raw) {
       seen.add(m);
       const o = document.createElement('option');
       o.value = m;
+      o.dataset.method = '1';
       o.textContent = 'method: ' + (m.length > 26 ? m.slice(0, 25) + '…' : m);
       el.huntMethod.appendChild(o);
     }
   }
   if (seen.size > 0) el.huntMethod.disabled = false;
+  // reset a stale selection that is no longer on the menu
+  if (el.huntMethod.value && el.huntMethod.selectedIndex === -1) {
+    el.huntMethod.value = '';
+    state.hunt.method = '';
+  }
 }
 
 function renderPageBar() {
@@ -719,6 +800,8 @@ function normalizeFinding(f) {
 
 function renderFindings() {
   el.findingsList.innerHTML = '';
+  // per-method metrics follow the current findings page (probe GET /metrics once per session)
+  probeMetrics().then(renderMethodMetrics).catch(renderMethodMetrics);
   if (state.findings.length === 0) {
     el.findingsList.innerHTML = '<p class="empty">No findings. The graph may be clean — or the hunt rules returned nothing.</p>';
     return;
@@ -750,6 +833,90 @@ function renderFindings() {
   });
 }
 
+/* ================= per-method hunt metrics =================
+ * Aggregated ONLY from real findings the API returned this session —
+ * never invented. Counts + severity split + share per detection_method.
+ * Precision/recall/MTTD per method need the backend GET /metrics contract;
+ * it is probed once and, when absent, the panel says so explicitly instead
+ * of fabricating numbers.
+ */
+const SEV_ORDER = ['critical', 'high', 'medium', 'low', 'info'];
+
+async function probeMetrics() {
+  if (state.metricsProbe) return state.metricsProbe;
+  try {
+    const d = await apiFetch(EP_METRICS);
+    // defensive: accept several plausible shapes, never assume
+    const pm = d.per_method ?? d.methods ?? d.hunt_metrics ?? d.by_method ?? null;
+    state.metricsProbe = { ok: true, methods: (pm && typeof pm === 'object') ? pm : null, raw: d };
+  } catch (e) {
+    state.metricsProbe = { ok: false, error: e.message };
+  }
+  return state.metricsProbe;
+}
+
+function renderMethodMetrics() {
+  const body = el.methodMetricsBody;
+  if (!body) return;
+  const byMethod = new Map(); // method -> {count, sev:{}}
+  for (const f of state.findings) {
+    const m = f.method || '(no method reported)';
+    if (!byMethod.has(m)) byMethod.set(m, { count: 0, sev: {} });
+    const b = byMethod.get(m);
+    b.count++;
+    const s = String(f.severity || 'info').toLowerCase();
+    b.sev[s] = (b.sev[s] || 0) + 1;
+  }
+  const total = state.findings.length;
+  if (!total) {
+    body.innerHTML =
+      '<p class="empty" style="padding:6px 2px">No findings in the current page — per-method metrics appear here once a hunt returns findings.</p>';
+    if (el.metricsSrc) el.metricsSrc.textContent = '';
+    return;
+  }
+  const rows = [...byMethod.entries()].sort((a, b) => b[1].count - a[1].count);
+  const extra = state.metricsProbe && state.metricsProbe.ok ? state.metricsProbe.methods : null;
+  const max = Math.max(1, ...rows.map(([, b]) => b.count));
+  body.innerHTML = rows.map(([m, b]) => {
+    const share = Math.round((b.count / total) * 100);
+    const bar = SEV_ORDER.map((s) => {
+      const n = b.sev[s] || 0;
+      if (!n) return '';
+      const w = (n / b.count) * 100;
+      return `<i class="sevbar ${sevClass(s)}" style="width:${w}%" title="${esc(s)}: ${n}"></i>`;
+    }).join('');
+    // optional GET /metrics enrichment (precision/recall/MTTD per method)
+    let enrich = '';
+    if (extra) {
+      const em = extra[m] || {};
+      const p = em.precision ?? em.precision_pct;
+      const rc = em.recall ?? em.recall_pct;
+      const mt = em.mttd_seconds ?? em.mttd;
+      const parts = [];
+      if (p !== undefined && p !== null && p !== '') parts.push(`precision <b>${esc(String(p))}</b>`);
+      if (rc !== undefined && rc !== null && rc !== '') parts.push(`recall <b>${esc(String(rc))}</b>`);
+      if (mt !== undefined && mt !== null && mt !== '') parts.push(`MTTD <b>${esc(String(mt))}s</b>`);
+      if (parts.length) enrich = `<div class="mm-enrich muted small">${parts.join(' · ')} <span class="contract-src">· <code>GET /metrics</code></span></div>`;
+    }
+    return `<div class="mm-row">
+      <div class="mm-top">
+        <span class="mm-method">${esc(m.length > 34 ? m.slice(0, 33) + '…' : m)}</span>
+        <span class="mm-count"><b>${b.count}</b> <span class="muted">· ${share}% of findings</span></span>
+      </div>
+      <div class="sevbar-track" title="${rows ? '' : ''}">${bar}</div>
+      ${enrich}
+    </div>`;
+  }).join('') + (state.metricsProbe && !state.metricsProbe.ok
+    ? '<p class="muted small mm-note">Per-method precision/recall/MTTD unavailable — <code>GET /metrics</code> is not in this backend build. Counts above are real, aggregated from the current hunt results.</p>'
+    : '');
+  if (el.metricsSrc) {
+    el.metricsSrc.textContent = state.metricsProbe && state.metricsProbe.ok
+      ? 'findings + GET /metrics' : 'from hunt findings';
+  }
+  const g = window.gsap;
+  if (g) g.from(body.querySelectorAll('.mm-row'),
+    { x: -10, opacity: 0, duration: 0.3, stagger: 0.05, ease: 'power2.out', overwrite: true });
+}
 /* ---- demo attack scenario: hunt, then highlight finding nodes as the attack path ---- */
 async function runDemoScenario() {
   el.btnDemo.disabled = true;
@@ -893,7 +1060,166 @@ async function loadDecisions() {
     // configured (decisions survive restarts); false/undefined = in-memory only
     state.persisted = d.persisted === true;
     state.queuePersisted = d.queue_persisted === true;
+    if (state.queueState === 'ready') renderQueue(); // sync audit badges onto queue rows
   } catch (e) { /* decisions history optional — queue still works */ }
+}
+
+/* ================= approval queue (task 2026-10-08) =================
+ * Real queued containment actions from GET /decisions.queue — nothing
+ * invented. Each row carries its impact tier, reversibility score and
+ * estimated business cost straight from the API; approve/reject posts back
+ * to POST /decisions and records the audit badge locally (same pattern as
+ * the blast-radius action rows). The summary bar aggregates the real queue:
+ * Σ estimated cost, average reversibility, impact-tier distribution.
+ */
+function renderQueueDepth() {
+  const qd = state.queueDepth;
+  if (!el.queueDepth) return;
+  if (qd === null || qd === undefined) { el.queueDepth.textContent = ''; return; }
+  el.queueDepth.textContent = `· ${qd} awaiting`;
+  el.queueDepth.className = 'queue-depth' + (qd > 0 ? ' hot' : '');
+}
+
+async function loadApprovalQueue() {
+  state.queueState = 'loading';
+  if (el.queueSummary) el.queueSummary.innerHTML =
+    '<p class="empty" style="padding:6px 2px">Loading the approval queue from <code>GET /decisions</code>…</p>';
+  if (el.approvalQueue) el.approvalQueue.innerHTML = '';
+  try {
+    const d = await apiFetch(EP_DECISIONS + '?limit=200');
+    const q = Array.isArray(d.queue) ? d.queue : [];
+    state.queue = q;
+    state.queueState = 'ready';
+    state.persisted = d.persisted === true;
+    state.queuePersisted = d.queue_persisted === true;
+    renderQueue();
+  } catch (e) {
+    state.queueState = 'error';
+    if (el.queueSummary) el.queueSummary.innerHTML =
+      `<p class="err-text" style="font-size:12px">Approval queue failed to load: ${esc(e.message)}</p>`;
+  }
+}
+
+function queueItemKey(q) {
+  return `${q.action || ''}|${q.target || ''}`;
+}
+
+function renderQueue() {
+  if (!el.approvalQueue || !el.queueSummary) return;
+  const q = state.queue;
+  // ---- summary bar: Σ cost, avg reversibility, tier mix — all from real rows
+  if (q.length) {
+    let cost = 0, rev = 0, revN = 0;
+    const tiers = { low: 0, medium: 0, high: 0, unknown: 0 };
+    for (const r of q) {
+      const c = Number(r.est_cost_usd);
+      if (Number.isFinite(c)) cost += c;
+      const v = Number(r.reversibility_score ?? r.reversibility);
+      if (Number.isFinite(v)) { rev += v; revN++; }
+      const t = String(r.impact_tier || 'unknown').toLowerCase();
+      tiers[tiers.hasOwnProperty(t) ? t : 'unknown']++;
+    }
+    const avgRev = revN ? (rev / revN) : null;
+    el.queueSummary.innerHTML =
+      `<div class="qsum" role="status" aria-label="queue summary: ${q.length} awaiting, estimated cost $${cost.toLocaleString()}">
+         <div class="qsum-cell"><span class="qsum-num">${q.length}</span><span class="qsum-label">awaiting approval</span></div>
+         <div class="qsum-cell"><span class="qsum-num">$${cost.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span><span class="qsum-label">Σ est. business cost</span></div>
+         <div class="qsum-cell"><span class="qsum-num">${avgRev !== null ? avgRev.toFixed(2) : '—'}</span><span class="qsum-label">avg reversibility</span></div>
+         <div class="qsum-cell qsum-tiers"><span class="qsum-label">impact tiers</span><span class="qsum-tiers-row">
+           ${tiers.high ? `<span class="tier tier-high">${tiers.high} high</span>` : ''}
+           ${tiers.medium ? `<span class="tier tier-medium">${tiers.medium} medium</span>` : ''}
+           ${tiers.low ? `<span class="tier tier-low">${tiers.low} low</span>` : ''}
+           ${tiers.unknown ? `<span class="tier tier-unknown">${tiers.unknown} n/a</span>` : ''}
+         </span></div>
+       </div>` +
+      (state.queuePersisted === false
+        ? '<p class="muted small" style="margin:6px 0 0">⚠ queue is in-memory only — a backend restart loses it. Analyst decisions still audit locally.</p>'
+        : '');
+  } else {
+    el.queueSummary.innerHTML =
+      '<p class="empty" style="padding:6px 2px">Queue empty — no irreversible actions are awaiting approval. ' +
+      'New containment proposals appear here via <code>POST /contain</code>.</p>';
+  }
+  // ---- queue rows
+  if (!q.length) { el.approvalQueue.innerHTML = ''; return; }
+  el.approvalQueue.innerHTML = q.map((r) => {
+    const key = queueItemKey(r);
+    const decided = state.decisions.get(key);
+    const tier = String(r.impact_tier || '').toLowerCase();
+    const tierCls = ['low', 'medium', 'high'].includes(tier) ? 'tier-' + tier : 'tier-unknown';
+    const rev = Number(r.reversibility_score ?? r.reversibility);
+    const revBar = Number.isFinite(rev)
+      ? `<span class="revtrack" title="reversibility ${rev.toFixed(2)} — higher = safer to approve"><i style="width:${Math.round(rev * 100)}%"></i></span>`
+      : '<span class="muted small">reversibility n/a</span>';
+    const cost = Number(r.est_cost_usd);
+    const when = r.created_at ? new Date(r.created_at).toLocaleString() : '';
+    return `<div class="qrow" data-key="${esc(key)}">
+      <div class="qrow-main">
+        <span class="tier ${tierCls}" title="business impact tier from the API">${esc(r.impact_tier || 'n/a')}</span>
+        <div style="flex:1;min-width:0">
+          <div class="action-text"><b>${esc(r.action || 'action')}</b> <span class="muted">→</span> <code>${esc(r.target || r.node_id || '')}</code></div>
+          <div class="qrow-meta muted small">${esc(when)}${r.requested_by ? ` · by ${esc(r.requested_by)}` : ''} · <span class="qstatus">${esc(r.status || 'queued')}</span></div>
+          <div class="qrow-cost">${revBar}<span class="qcost" title="estimated business impact cost from the API">${Number.isFinite(cost) ? '≈ $' + cost.toLocaleString() : 'cost n/a'}</span></div>
+        </div>
+      </div>
+      <div class="qrow-foot">
+        ${decided
+          ? `<span class="dec-badge ${decided === 'approved' ? 'approved' : 'rejected'}">${decided === 'approved' ? '✓ approved' : '✕ rejected'} · recorded</span>`
+          : `<button class="btn decide approve sm" data-k="${esc(key)}" data-d="approved">✓ Approve</button>
+             <button class="btn decide reject sm" data-k="${esc(key)}" data-d="rejected">✕ Reject</button>
+             <span class="muted small">nothing executes without this</span>`}
+      </div>
+    </div>`;
+  }).join('');
+  el.approvalQueue.querySelectorAll('.btn.decide').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const row = btn.closest('.qrow');
+      const item = state.queue.find((x) => queueItemKey(x) === btn.dataset.k);
+      if (item) decideQueued(item, btn.dataset.d, btn, row);
+    });
+  });
+}
+
+async function decideQueued(item, decision, btn, rowElm) {
+  if (btn) btn.disabled = true;
+  try {
+    const res = await apiFetch(EP_DECISIONS, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        node_id: item.node_id || item.target || '',
+        action: item.action || '',
+        target: item.target || '',
+        decision,
+        rationale: `analyst ${decision} on queued action via dashboard approval queue`,
+      }),
+    });
+    const stored = res && res.stored === true;
+    state.decisions.set(queueItemKey(item), decision);
+    const verdict = decision === 'approved' ? '✓ approved' : '✕ rejected';
+    toast(stored
+      ? `${verdict}: ${item.action} → ${item.target || item.node_id}`
+      : `${verdict}: ${item.action} — recorded IN-MEMORY ONLY (Supabase not configured)`,
+      decision === 'approved' ? 'ok' : 'warn');
+    // refresh the row in place so the audit badge shows immediately
+    if (rowElm) {
+      const foot = rowElm.querySelector('.qrow-foot');
+      if (foot) foot.innerHTML =
+        `<span class="dec-badge ${decision === 'approved' ? 'approved' : 'rejected'}">${verdict} · recorded</span>`;
+      const g = window.gsap;
+      if (g) g.from(rowElm, { opacity: 0.4, duration: 0.35, ease: 'power2.out' });
+    }
+  } catch (e) {
+    toast('Decision failed: ' + e.message, 'err');
+    if (btn) btn.disabled = false;
+  }
+}
+
+/* scroll the right panel to the approval queue (shortcut / palette) */
+function scrollToQueue() {
+  const qd = document.getElementById('queueDepth');
+  if (qd && qd.scrollIntoView) qd.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  loadApprovalQueue();
 }
 
 /* Honest persistence badge for the containment queue, driven ONLY by the
@@ -1051,6 +1377,7 @@ function renderDpdp() {
           : ''}
       <div class="dpdp-metrics">
         <div><span class="sm-num">${anyRegulated ? state.dpdpRegulatedSet.size : '—'}</span><span class="sm-label">regulated nodes in radius</span></div>
+        <div><span class="sm-num">${ds ? ds.length : '—'}</span><span class="sm-label">regulated datasets in radius</span></div>
         <div><span class="sm-num">${affected !== null && affected !== undefined ? Number(affected).toLocaleString() : '—'}</span><span class="sm-label">affected individuals (est.)</span></div>
       </div>
       ${datasetsHtml}
@@ -1269,6 +1596,7 @@ function renderScenarioResult(s, r) {
     name: s ? s.name : '', id: s ? s.id : '',
     detected, coverage, mttd, mttc, fp, fired, prec,
   };
+  saveRunToHistory(s, r); // timestamped real-run record → history, trend, comparison
   const timeline = stages.length
     ? `<div class="stage-timeline" aria-label="attack stage timeline">` + stages.map((st) => {
         const ok = String(st.status || '').toLowerCase() === 'detected';
@@ -1308,6 +1636,205 @@ function renderScenarioResult(s, r) {
       g.from(cells, { y: 12, opacity: 0, duration: 0.35, stagger: 0.06, ease: 'power2.out', delay: 0.12, overwrite: true });
     }
   }
+}
+
+/* ================= red-team run history, trend & comparison (2026-10-08) =================
+ * Every entry is a REAL run record: the scenario's actual API response plus
+ * the timestamp it completed. Kept in this browser's localStorage (never
+ * synced, never invented). Powers the MTTD/MTTC trend chart and the
+ * side-by-side run comparison.
+ */
+const HISTORY_KEY = 'graphops.runHistory.v1';
+const HISTORY_MAX = 50;
+
+function loadRunHistory() {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    state.history = Array.isArray(arr) ? arr.filter((h) => h && h.ts && h.scenarioId) : [];
+  } catch (e) { state.history = []; }
+  state.historyCompare = [];
+}
+function persistRunHistory() {
+  try {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(state.history.slice(0, HISTORY_MAX)));
+  } catch (e) { /* storage full/blocked — history stays session-only */ }
+}
+
+function saveRunToHistory(s, r) {
+  const stages = Array.isArray(r.stages) ? r.stages.map((st) => ({
+    stage: String(st.stage ?? st.name ?? ''),
+    status: String(st.status ?? ''),
+    delay: st.detection_delay_s ?? st.delay_s ?? null,
+  })) : [];
+  const missed = typeof r.missed === 'number' ? r.missed : null;
+  const detectedCount = typeof r.detected === 'number' ? r.detected
+    : (stages.length ? stages.filter((x) => x.status.toLowerCase() === 'detected').length
+      : (r.detected === true ? 1 : 0));
+  const entry = {
+    ts: Date.now(),
+    key: `${Date.now()}-${s ? s.id : 'run'}`,
+    scenarioId: s ? s.id : '',
+    scenarioName: s ? s.name : '',
+    detected: detectedCount > 0 || r.detected === true,
+    detectedCount, missed,
+    mttd: r.mttd_seconds ?? r.mttd ?? null,
+    mttc: r.mttc_seconds ?? r.mttc ?? r.analyst_response_sla_seconds ?? null,
+    fp: r.false_positives ?? r.falsePositives ?? null,
+    fired: r.detections_fired_total ?? r.detectionsFiredTotal ?? null,
+    prec: null,
+    stages,
+  };
+  let prec = r.blast_radius_precision ?? r.blast_precision ?? r.precision ??
+    ((r.blast_radius && typeof r.blast_radius === 'object') ? r.blast_radius.precision : null);
+  if (prec !== null && prec !== undefined && prec !== '' && Number.isFinite(Number(prec))) {
+    const pn = Number(prec);
+    entry.prec = (pn > 0 && pn <= 1) ? pn * 100 : pn;
+  }
+  state.history.unshift(entry);
+  state.history = state.history.slice(0, HISTORY_MAX);
+  persistRunHistory();
+  renderRunHistory();
+}
+
+function clearRunHistory() {
+  state.history = [];
+  state.historyCompare = [];
+  persistRunHistory();
+  renderRunHistory();
+  toast('Run history cleared', 'info');
+}
+
+/* MTTD/MTTC trend as inline SVG — only real recorded values, per scenario */
+function historyTrendSvg(scenarioId) {
+  const runs = state.history.filter((h) => h.scenarioId === scenarioId).reverse();
+  const pts = (get) => runs
+    .map((h) => Number(h[get]))
+    .filter((v) => Number.isFinite(v));
+  const mttd = pts('mttd'), mttc = pts('mttc');
+  if (!mttd.length && !mttc.length) {
+    return '<p class="muted small" style="margin:6px 0">No numeric MTTD/MTTC recorded yet for this scenario.</p>';
+  }
+  if (runs.length < 2) {
+    return '<p class="muted small" style="margin:6px 0">Trend needs at least 2 recorded runs of this scenario — run it again.</p>';
+  }
+  const W = 300, H = 74, PAD = 8;
+  const series = [];
+  const mk = (vals, color, name) => {
+    const max = Math.max(...vals), min = Math.min(...vals);
+    const span = max - min || 1;
+    const path = vals.map((v, i) => {
+      const x = PAD + (i / (vals.length - 1)) * (W - 2 * PAD);
+      const y = H - PAD - ((v - min) / span) * (H - 2 * PAD);
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(' ');
+    series.push(`<polyline points="${path}" fill="none" stroke="${color}" stroke-width="2"/>` +
+      vals.map((v, i) => {
+        const x = PAD + (i / (vals.length - 1)) * (W - 2 * PAD);
+        const y = H - PAD - ((v - min) / span) * (H - 2 * PAD);
+        return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="3" fill="${color}"><title>${name}: ${v}s</title></circle>`;
+      }).join(''));
+  };
+  if (mttd.length >= 2) mk(mttd, '#22d3ee', 'MTTD');
+  if (mttc.length >= 2) mk(mttc, '#a78bfa', 'MTTC');
+  return `<div class="trend" role="img" aria-label="MTTD and MTTC trend over ${runs.length} recorded runs">
+    <svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" aria-hidden="true">${series.join('')}</svg>
+    <div class="trend-legend muted small">
+      <span><i class="trend-swatch" style="background:#22d3ee"></i>MTTD (s)</span>
+      <span><i class="trend-swatch" style="background:#a78bfa"></i>MTTC (s)</span>
+      <span>${runs.length} recorded runs</span>
+    </div></div>`;
+}
+
+function renderRunHistory() {
+  if (!el.runHistory) return;
+  const n = state.history.length;
+  if (el.historyCount) el.historyCount.textContent = n ? `(${n} recorded)` : '';
+  if (!n) {
+    el.runHistory.innerHTML =
+      '<p class="empty" style="padding:6px 2px">No runs recorded yet in this browser — run a scenario above; each real run is timestamped and kept here for trend and comparison.</p>';
+    return;
+  }
+  const latestScenario = state.history[0].scenarioId;
+  el.runHistory.innerHTML =
+    `<div class="hist-trend"><div class="hist-trend-head muted small">MTTD/MTTC trend — <b>${esc(state.history[0].scenarioName || latestScenario)}</b> (latest scenario)</div>${historyTrendSvg(latestScenario)}</div>` +
+    state.history.map((h) => {
+      const sel = state.historyCompare.includes(h.key);
+      const when = new Date(h.ts).toLocaleString();
+      return `<div class="hist-row${sel ? ' sel' : ''}" data-key="${esc(h.key)}">
+        <label class="hist-cmp" title="select for side-by-side comparison">
+          <input type="checkbox" data-cmp="${esc(h.key)}"${sel ? ' checked' : ''} aria-label="select run for comparison">
+        </label>
+        <div class="hist-main">
+          <div class="hist-top"><b>${esc(h.scenarioName || h.scenarioId)}</b>
+            <span class="det ${h.detected ? 'yes' : 'no'}">${h.detected ? '✓ detected' : '✕ missed'}</span></div>
+          <div class="hist-meta muted small">${esc(when)} · MTTD <b>${fmtMetric(h.mttd)}</b> · MTTC <b>${fmtMetric(h.mttc)}</b>${h.prec !== null ? ` · precision <b>${fmtMetric(h.prec, '%')}</b>` : ''}</div>
+        </div>
+      </div>`;
+    }).join('') +
+    `<div class="hist-foot">
+       <button class="btn ghost sm" id="btnClearHistory">clear history</button>
+       <span class="muted small">tick two runs to compare</span>
+     </div>` +
+    `<div id="histCompare" class="hist-compare"></div>`;
+  const cb = document.getElementById('btnClearHistory');
+  if (cb) cb.addEventListener('click', clearRunHistory);
+  el.runHistory.querySelectorAll('[data-cmp]').forEach((box) => {
+    box.addEventListener('change', () => {
+      const k = box.dataset.cmp;
+      if (box.checked) {
+        state.historyCompare.push(k);
+        if (state.historyCompare.length > 2) {
+          const dropped = state.historyCompare.shift();
+          const old = el.runHistory.querySelector(`[data-cmp="${CSS.escape(dropped)}"]`);
+          if (old) old.checked = false;
+        }
+      } else {
+        state.historyCompare = state.historyCompare.filter((x) => x !== k);
+      }
+      renderRunHistory();
+    });
+  });
+  renderHistoryCompare();
+  const g = window.gsap;
+  if (g) g.from(el.runHistory.querySelectorAll('.hist-row'),
+    { x: -8, opacity: 0, duration: 0.25, stagger: 0.03, ease: 'power2.out', overwrite: true });
+}
+
+function renderHistoryCompare() {
+  const host = document.getElementById('histCompare');
+  if (!host) return;
+  if (state.historyCompare.length !== 2) {
+    host.innerHTML = state.historyCompare.length === 1
+      ? '<p class="muted small">Select one more run for a side-by-side comparison.</p>' : '';
+    return;
+  }
+  const [a, b] = state.historyCompare.map((k) => state.history.find((h) => h.key === k)).filter(Boolean);
+  if (!a || !b) { host.innerHTML = ''; return; }
+  const row = (label, fa, fb, better) => {
+    const va = fa(a), vb = fb(b);
+    const win = better && va !== null && vb !== null && va !== undefined && vb !== undefined && va !== vb
+      ? (better(va, vb) ? 'a' : 'b') : null;
+    const cell = (v, w) => `<td class="${w ? 'cmp-win' : ''}">${v === null || v === undefined ? '—' : esc(String(v))}</td>`;
+    return `<tr><th>${label}</th>${cell(va, win === 'a')}${cell(vb, win === 'b')}</tr>`;
+  };
+  const dt = (h) => new Date(h.ts).toLocaleString();
+  host.innerHTML =
+    `<table class="cmp-table" aria-label="side-by-side run comparison">
+      <thead><tr><th></th><th>${esc(a.scenarioName || a.scenarioId)}<br><span class="muted small">${esc(dt(a))}</span></th>
+      <th>${esc(b.scenarioName || b.scenarioId)}<br><span class="muted small">${esc(dt(b))}</span></th></tr></thead>
+      <tbody>
+        ${row('verdict', (h) => (h.detected ? '✓ detected' : '✕ missed'), (h) => (h.detected ? '✓ detected' : '✕ missed'))}
+        ${row('MTTD (s)', (h) => h.mttd, (h) => h.mttd, (x, y) => x < y)}
+        ${row('MTTC (s)', (h) => h.mttc, (h) => h.mttc, (x, y) => x < y)}
+        ${row('stages detected', (h) => h.detectedCount, (h) => h.detectedCount, (x, y) => x > y)}
+        ${row('false positives', (h) => h.fp, (h) => h.fp, (x, y) => x < y)}
+        ${row('detections fired', (h) => h.fired, (h) => h.fired, (x, y) => x > y)}
+        ${row('blast precision (%)', (h) => h.prec, (h) => h.prec, (x, y) => x > y)}
+      </tbody>
+    </table>`;
+  const g = window.gsap;
+  if (g) g.from(host, { opacity: 0, y: 8, duration: 0.4, ease: 'power2.out' });
 }
 
 /* judge-friendly narration — every number is a real measured value from the run above */
@@ -1482,7 +2009,9 @@ function focusFinding(i) {
 function exposeBridge() {
   window.GraphOps = {
     getGraphData: () => ({
-      nodes: state.nodes.map((n) => ({ id: n.id, etype: n.etype, label: n.label, degree: n.degree, dc: n.dc })),
+      nodes: state.nodes.map((n) => ({ id: n.id, etype: n.etype, label: n.label, degree: n.degree, dc: n.dc,
+        // x/y in canvas CSS px — read-only, for hit-testing/automation (rounded)
+        x: Math.round(n.x), y: Math.round(n.y) })),
       edges: state.edges.map((e) => ({ a: e.source.id, b: e.target.id, etype: e.etype })),
     }),
     getBlast: () => (state.blast
@@ -1514,6 +2043,15 @@ function exposeBridge() {
     toggleAutoRefresh: () => setAutoRefresh(!state.autoRefreshOn),
     isAutoRefresh: () => state.autoRefreshOn,
     openDrawerForFinding: (i) => openDrawer(state.findings[i]),
+    // 2026-10-08 additions
+    scrollToReplay: () => { const r = document.getElementById('replay'); if (r) r.scrollIntoView({ behavior: 'smooth', block: 'start' }); },
+    scrollToQueue,
+    refreshQueue: loadApprovalQueue,
+    getQueueDepth: () => state.queueDepth,
+    getMethodMetrics: () => ({ probe: state.metricsProbe, findings: state.findings.length }),
+    clearRunHistory,
+    openShortcuts: () => { const o = document.getElementById('shortcutsOverlay'); if (o) o.hidden = false; },
+    closeShortcuts: () => { const o = document.getElementById('shortcutsOverlay'); if (o) o.hidden = true; },
   };
   if (window.Graph3D) {
     window.Graph3D.onNodeClick = (id) => handleNodeClick(id);
