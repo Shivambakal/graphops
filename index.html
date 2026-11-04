@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GraphOps — SOC Incident Reasoning &amp; Blast Radius Engine · hackFront India</title>
+<style>
+  :root{
+    --bg:#0b0a08; --bg2:#100e0b; --panel:#15120e; --panel2:#1b1712;
+    --line:#26211a; --line2:#3a3226;
+    --text:#ece7db; --muted:#a09a8b; --faint:#6b655a;
+    --teal:#4f7d7a; --teal-glow:#4f7d7a2e;
+    --gold:#c9973f; --emerald:#5f8f6e; --emerald-glow:#5f8f6e2e;
+    --crimson:#b3273a; --crimson-glow:#b3273a30;
+    --amber:#bd8136; --pathgold:#c9973f; --ember:#a06a3c;
+    --blue:#5b7fa6; --cyan:#5f7f8e; --purple:#77677f;
+    --mono:"Cascadia Code","JetBrains Mono",Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{background:radial-gradient(1200px 700px at 70% -10%,#160c08 0%,var(--bg) 60%) fixed,var(--bg);
+       color:var(--text);font-family:"Segoe UI",system-ui,-apple-system,sans-serif;
+       display:flex;flex-direction:column;overflow:hidden;font-size:13px}
+
+  /* ---------- top bar / SOC header ---------- */
+  header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;row-gap:8px;padding:9px 16px;
+    background:rgba(11,10,8,.92);border-bottom:1px solid var(--line);backdrop-filter:blur(8px);z-index:30}
+  .logo{display:flex;align-items:center;gap:10px}
+  .logo .mark{width:34px;height:34px;border-radius:9px;
+    background:linear-gradient(135deg,#9a7433,#c9973f);
+    border:1px solid var(--line2);display:flex;align-items:center;justify-content:center;
+    font-family:var(--mono);font-weight:700;color:#14100a;font-size:15px;
+    box-shadow:0 0 14px rgba(201,151,63,.25)}
+  .logo h1{font-size:15px;letter-spacing:.5px;font-weight:700}
+  .logo h1 small{display:block;font-size:10px;color:var(--muted);font-weight:400;letter-spacing:.3px}
+
+  .status-badge{font-size:11px;font-weight:700;padding:4px 10px;border-radius:20px;display:flex;align-items:center;gap:6px;letter-spacing:.4px;white-space:nowrap}
+  .status-badge.healthy{background:#082418;color:var(--emerald);border:1px solid #1a5e3f}
+  .status-badge.active{background:#350c14;color:var(--crimson);border:1px solid #7c1a29;box-shadow:0 0 14px var(--crimson-glow);animation:pulse-badge 2s infinite}
+  @keyframes pulse-badge{0%,100%{opacity:1}50%{opacity:.8}}
+
+  .live-indicator{display:flex;align-items:center;gap:6px;font-size:11px;font-family:var(--mono);color:var(--teal);background:#071c1b;border:1px solid #134e48;padding:4px 9px;border-radius:14px;white-space:nowrap}
+  .live-dot{width:7px;height:7px;border-radius:50%;background:var(--teal);box-shadow:0 0 8px var(--teal);animation:blink 1.5s infinite}
+  @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+
+  .stats{display:flex;gap:7px;margin-left:auto;flex-wrap:wrap}
+  .chip{background:var(--panel);border:1px solid var(--line);border-radius:7px;padding:4px 10px;
+    font-size:11px;color:var(--muted);white-space:nowrap}
+  .chip b{color:var(--text);font-family:var(--mono);font-size:12.5px;margin-left:4px}
+  .chip.hot b{color:var(--crimson)} .chip.warn b{color:var(--amber)} .chip.teal b{color:var(--teal)}
+
+  .hbtn{background:var(--panel2);color:var(--text);border:1px solid var(--line2);border-radius:7px;
+    padding:6px 11px;font-size:11.5px;font-weight:600;cursor:pointer;white-space:nowrap;transition:all .15s ease}
+  .hbtn:hover{border-color:var(--teal);color:var(--teal)}
+  .hbtn:disabled{opacity:.4;cursor:not-allowed}
+  .hbtn.primary{background:#2a1503;border-color:#8a6a24;color:var(--teal)}
+  .hbtn.lab{background:linear-gradient(180deg,#1c2d44,#101b2c);border-color:#2f5380;color:#5b7fa6}
+  .hbtn.lab:hover{border-color:#5b7fa6;box-shadow:0 0 14px #5b7fa62e}
+  .hbtn.tests{background:#111c18;border-color:#1c523c;color:var(--emerald)}
+  .hbtn.tests:hover{border-color:var(--emerald);box-shadow:0 0 12px var(--emerald-glow)}
+
+  .seg{display:flex;border:1px solid var(--line2);border-radius:7px;overflow:hidden}
+  .seg button{background:transparent;border:none;color:var(--muted);padding:6px 10px;font-size:11.5px;
+    font-weight:700;cursor:pointer}
+  .seg button.on{background:#2a1f0d;color:var(--teal)}
+  select.hsel{background:var(--panel2);color:var(--text);border:1px solid var(--line2);
+    border-radius:7px;padding:6px 8px;font-size:11.5px}
+
+  /* ---------- layout ---------- */
+  main{flex:1;display:flex;min-height:0}
+  #left{width:310px;min-width:310px;background:rgba(12,10,7,.92);border-right:1px solid var(--line);
+    padding:12px;overflow-y:auto}
+  #center{flex:1;position:relative;min-width:0;background:
+    radial-gradient(circle at 50% 40%,#0d0805 0%,#010204 70%)}
+  #right{width:410px;min-width:410px;background:rgba(12,10,7,.92);border-left:1px solid var(--line);
+    display:flex;flex-direction:column;min-height:0}
+
+  #net2d,#net3d{position:absolute;inset:0}
+  #net3d{display:none}
+
+  /* ---------- floating center HUDs ---------- */
+  #recBanner{position:absolute;top:14px;left:18px;right:18px;z-index:20;
+    background:linear-gradient(90deg,rgba(24,19,12,.95),rgba(16,13,9,.95));
+    border:1px solid #5b7fa6;border-radius:10px;padding:10px 14px;
+    display:none;align-items:center;gap:12px;box-shadow:0 8px 30px rgba(0,0,0,.6),0 0 18px rgba(201,151,63,.13);
+    backdrop-filter:blur(10px);animation:slide-down .3s cubic-bezier(.16,1,.3,1)}
+  @keyframes slide-down{from{transform:translateY(-14px);opacity:0}to{transform:none;opacity:1}}
+  #center.drawer-open #recBanner{right:354px}
+  #recBanner .icon{font-size:20px}
+  #recBanner .content{flex:1;min-width:0}
+  #recBanner .title{font-size:12px;font-weight:700;color:#9db4c8;display:flex;align-items:center;gap:8px}
+  #recBanner .title .pill-rec{background:#1d4ed8;color:#fff;font-size:10px;padding:1px 6px;border-radius:12px}
+  #recBanner .reason{font-size:11.5px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #recBanner button{background:#2563eb;color:#fff;border:none;border-radius:6px;padding:6px 12px;font-size:11.5px;font-weight:700;cursor:pointer;white-space:nowrap}
+  #recBanner button:hover{background:#5b7fa6}
+
+  #replayHUD{position:absolute;bottom:20px;left:50%;transform:translateX(-50%);z-index:22;
+    background:rgba(15,12,9,.95);border:1px solid #c9973f;border-radius:10px;padding:9px 18px;
+    display:none;align-items:center;gap:16px;box-shadow:0 8px 32px rgba(0,0,0,.7),0 0 20px rgba(201,151,63,.13);
+    backdrop-filter:blur(8px)}
+  #replayHUD .time{font-family:var(--mono);font-size:14px;font-weight:700;color:var(--pathgold)}
+  #replayHUD .step-text{font-size:12px;color:var(--text);font-weight:600}
+  #replayHUD .tech-badge{font-family:var(--mono);font-size:10.5px;background:#2a200e;color:var(--amber);padding:2px 7px;border-radius:4px;border:1px solid #634b17}
+
+  #telemetryTicker{position:absolute;bottom:10px;left:14px;right:14px;z-index:18;
+    background:rgba(11,10,8,.8);border:1px solid var(--line);border-radius:8px;padding:5px 10px;
+    font-family:var(--mono);font-size:11px;color:var(--muted);display:flex;align-items:center;gap:10px;
+    backdrop-filter:blur(6px);pointer-events:none}
+  #telemetryTicker .tag{color:var(--teal);font-weight:700;letter-spacing:.5px}
+  #telemetryTicker .event{color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+  #cdnError{position:absolute;inset:0;display:none;align-items:center;justify-content:center;
+    text-align:center;padding:40px;color:var(--muted);z-index:25}
+  #cdnError .box{max-width:460px;border:1px solid var(--line2);background:var(--panel);
+    border-radius:12px;padding:28px}
+  #cdnError h2{color:var(--crimson);margin-bottom:10px;font-size:16px}
+
+  /* ---------- cards / controls ---------- */
+  .card{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--line);
+    border-radius:10px;padding:11px;margin-bottom:10px}
+  .card h3{font-size:10.5px;text-transform:uppercase;letter-spacing:1.2px;color:var(--teal);margin-bottom:8px;display:flex;align-items:center;justify-content:space-between}
+  .card h3 .n{color:var(--faint);margin-right:6px}
+  label.f{display:block;font-size:11px;color:var(--muted);margin:7px 0 3px}
+  select.w,input.w{width:100%;background:#06080d;color:var(--text);border:1px solid var(--line2);
+    border-radius:7px;padding:7px;font-size:12px}
+  input.w:focus,select.w:focus{outline:none;border-color:var(--teal)}
+
+  .btn{width:100%;border:none;border-radius:8px;padding:9px;font-weight:700;font-size:12.5px;
+    cursor:pointer;margin-top:7px;letter-spacing:.3px;transition:all .15s ease}
+  .btn.breach{background:linear-gradient(180deg,#ff4d2e,#c21430);color:#fff;
+    box-shadow:0 4px 20px #b3273a38, inset 0 1px 0 #ece7db2e}
+  .btn.breach:hover{filter:brightness(1.15);box-shadow:0 4px 26px #b3273a55}
+  .btn.replay{background:linear-gradient(180deg,#bd8136,#b45309);color:#fff;
+    box-shadow:0 3px 14px #bd81362e}
+  .btn.replay:hover{filter:brightness(1.15)}
+  .btn.ghost{background:#111520;color:var(--text);border:1px solid var(--line2)}
+  .btn.ghost:hover{border-color:var(--teal);color:var(--teal)}
+  .btn.small{padding:5px 9px;font-size:11px;width:auto;margin-top:4px}
+  .btn:disabled{opacity:.4;cursor:not-allowed}
+  .row{display:flex;gap:7px;align-items:center}
+  .row .grow{flex:1}
+  .chk{display:flex;align-items:center;gap:7px;font-size:11.5px;color:var(--muted);margin:4px 0;cursor:pointer}
+  .chk input{accent-color:var(--teal)}
+  .dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:5px;vertical-align:baseline}
+  .legend{font-size:11px;color:var(--muted);line-height:2}
+
+  /* timeline */
+  #timeline{width:100%;accent-color:var(--crimson);margin:5px 0}
+  .tctl{display:flex;gap:5px;align-items:center;margin-top:5px}
+  .tbtn{background:#111520;border:1px solid var(--line2);color:var(--text);border-radius:6px;
+    padding:4px 9px;font-size:11.5px;cursor:pointer;font-family:var(--mono)}
+  .tbtn:hover{border-color:var(--teal);color:var(--teal)}
+  .tbtn:disabled{opacity:.4;cursor:not-allowed}
+  #timelineLabel{font-family:var(--mono);font-size:11px;color:var(--amber);margin-left:auto}
+
+  /* ---------- right tabs ---------- */
+  .tabs{display:flex;border-bottom:1px solid var(--line);flex:none;background:rgba(14,12,9,.8)}
+  .tabs button{flex:1;background:transparent;border:none;color:var(--muted);padding:10px 4px;
+    font-size:11px;font-weight:700;cursor:pointer;border-bottom:2px solid transparent;letter-spacing:.3px;transition:all .15s ease}
+  .tabs button.on{color:var(--teal);border-bottom-color:var(--teal);background:rgba(79,125,122,.07)}
+  .tabs button:hover:not(.on){color:var(--text)}
+  .tabbody{flex:1;overflow-y:auto;padding:12px;min-height:0}
+  .tabpage{display:none}.tabpage.on{display:block}
+
+  .node-line{padding:7px 9px;border:1px solid var(--line);border-radius:8px;margin-bottom:6px;
+    background:#0a0d14;cursor:pointer;transition:border-color .15s ease}
+  .node-line:hover{border-color:var(--teal)}
+  .node-line .meta{font-size:11px;color:var(--muted);font-family:var(--mono);margin-top:3px;line-height:1.5}
+  .node-line .tech{color:var(--pathgold)}
+  .node-line.contained{border-style:dashed;border-color:#5b7fa6;opacity:.7}
+
+  .pill{display:inline-block;padding:1px 7px;border-radius:16px;font-size:10px;font-weight:800;letter-spacing:.4px}
+  .pill.high{background:#2a1215;color:var(--crimson);border:1px solid #7a1f2b}
+  .pill.med{background:#33230c;color:var(--amber);border:1px solid #6e521d}
+  .pill.low{background:#0b2e20;color:var(--emerald);border:1px solid #1d5c44}
+  .pill.entry{background:#241c0e;color:var(--teal);border:1px solid #8a6a24}
+  .pill.contained{background:#11223a;color:#5b7fa6;border:1px solid #2563eb}
+  .pill.tech{background:#231a0e;color:var(--gold);border:1px solid #57401a;font-family:var(--mono)}
+
+  .pathbox{border:1px solid var(--line);border-left:3px solid var(--pathgold);border-radius:8px;
+    padding:9px 11px;margin-bottom:9px;background:#0a0d14;font-size:12px}
+  .pathbox .hops{font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:5px;line-height:1.7}
+  .pathbox .hops b{color:var(--pathgold)}
+
+  .prediction-card{border:1px solid #2e2815;border-left:3px solid var(--amber);border-radius:8px;padding:9px 11px;margin-bottom:9px;background:#0d0f17}
+  .prediction-card .header{display:flex;align-items:center;justify-content:space-between}
+  .prediction-card .conf{font-family:var(--mono);font-size:12px;font-weight:700;color:var(--amber)}
+  .badge-tag{display:inline-block;background:#151a26;border:1px solid var(--line2);border-radius:4px;padding:2px 6px;font-size:10px;color:var(--muted);margin:2px 3px 2px 0}
+  .badge-tag.highlight{border-color:#78350f;color:#fcd34d;background:#2d1c08}
+
+  .containment-matrix{background:#090d16;border:1px solid var(--line2);border-radius:9px;padding:12px;margin-bottom:12px}
+  .metric-bar-wrap{margin-bottom:8px}
+  .metric-bar-label{display:flex;justify-content:space-between;font-size:11px;margin-bottom:3px;color:var(--muted)}
+  .metric-bar{height:7px;background:#141926;border-radius:4px;overflow:hidden;position:relative}
+  .metric-bar-fill{height:100%;border-radius:4px;transition:width .4s ease}
+  .metric-bar-fill.red{background:linear-gradient(90deg,#b3273a,#dc2626)}
+  .metric-bar-fill.green{background:linear-gradient(90deg,#10b981,#059669)}
+
+  .action-table{width:100%;border-collapse:collapse;font-size:11.5px;margin-top:8px}
+  .action-table th,.action-table td{border:1px solid var(--line);padding:7px 8px;text-align:left}
+  .action-table th{background:#0f1422;color:var(--teal);font-size:10px;text-transform:uppercase;letter-spacing:.5px}
+  .action-table tr.best{background:rgba(91,127,166,.13);border:1px solid #5b7fa6}
+  .action-table .score{font-family:var(--mono);font-weight:700;color:var(--emerald)}
+
+  .threat-story{background:#090c14;border:1px solid var(--line);border-radius:9px;padding:12px;margin-bottom:12px}
+  .story-step{display:flex;gap:10px;margin-bottom:10px;position:relative}
+  .story-step::before{content:"";position:absolute;left:11px;top:22px;bottom:-10px;width:2px;background:var(--line2)}
+  .story-step:last-child::before{display:none}
+  .story-bullet{width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;background:var(--panel2);border:1px solid var(--line2);flex-shrink:0;z-index:1}
+  .story-bullet.active{border-color:var(--crimson);color:var(--crimson);background:#330e16}
+  .story-bullet.done{border-color:var(--teal);color:var(--teal);background:#092b27}
+  .story-content h5{font-size:11.5px;color:var(--text);margin-bottom:2px}
+  .story-content p{font-size:11px;color:var(--muted);line-height:1.5}
+
+  .diff-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}
+  .diff-card{background:#0b0f1a;border:1px solid var(--line);border-radius:7px;padding:8px 10px}
+  .diff-card .num{font-family:var(--mono);font-size:18px;font-weight:700}
+  .diff-card.plus .num{color:var(--crimson)}
+  .diff-card.minus .num{color:var(--emerald)}
+  .diff-card .lbl{font-size:10.5px;color:var(--muted);margin-top:2px}
+
+  .kv{font-size:11.5px;color:var(--muted);line-height:1.8}
+  .kv b{color:var(--text);font-family:var(--mono)}
+  table.cmp{width:100%;border-collapse:collapse;font-size:11.5px;margin-top:8px}
+  table.cmp th,table.cmp td{border:1px solid var(--line);padding:6px 8px;text-align:left}
+  table.cmp th{background:#0f1422;color:var(--teal);font-size:10px;text-transform:uppercase;letter-spacing:.6px}
+  table.cmp td{font-family:var(--mono)}
+
+  .chart{width:100%;height:200px;margin-bottom:12px}
+  .chartTitle{font-size:10.5px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin:10px 0 4px}
+  .fallback-note{font-size:11.5px;color:var(--amber);background:#2b1f0e;border:1px solid #6e521d;
+    border-radius:8px;padding:8px 10px;margin-bottom:10px}
+
+  .guide h4{color:var(--teal);font-size:12.5px;margin:12px 0 5px}
+  .guide p,.guide li{font-size:12px;color:var(--muted);line-height:1.6}
+  .guide ol,.guide ul{margin-left:16px}
+  .guide code{font-family:var(--mono);color:var(--pathgold);font-size:11px}
+  .empty{color:var(--faint);font-size:12px;text-align:center;padding:26px 10px;line-height:1.7}
+
+  /* node / edge drawer */
+  #drawer{position:absolute;top:0;right:0;width:340px;max-width:85%;height:100%;z-index:40;
+    background:rgba(13,11,8,.98);border-left:1px solid var(--line2);padding:16px;overflow-y:auto;
+    transform:translateX(105%);transition:transform .25s ease;box-shadow:-12px 0 40px rgba(0,0,0,.7)}
+  #drawer.open{transform:none}
+  #drawer h2{font-size:15px;margin-bottom:2px}
+  #drawer .gsub{font-size:11px;color:var(--muted);margin-bottom:12px}
+  #drawerClose{position:absolute;top:10px;right:12px;background:none;border:none;color:var(--muted);
+    font-size:18px;cursor:pointer}
+  #drawerClose:hover{color:var(--crimson)}
+
+  /* modal styles */
+  .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.8);backdrop-filter:blur(6px);z-index:100;display:none;align-items:center;justify-content:center;padding:20px}
+  .modal-overlay.open{display:flex}
+  .modal-box{background:var(--panel2);border:1px solid var(--line2);border-radius:12px;width:100%;max-width:680px;max-height:85vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.8)}
+  .modal-header{padding:14px 18px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between}
+  .modal-header h3{font-size:14px;color:var(--text);display:flex;align-items:center;gap:8px}
+  .modal-body{padding:18px;overflow-y:auto;flex:1}
+  .modal-close{background:none;border:none;color:var(--muted);font-size:18px;cursor:pointer}
+  .modal-close:hover{color:var(--crimson)}
+  textarea.import-area{width:100%;height:180px;background:#0d0b09;color:var(--text);font-family:var(--mono);font-size:11.5px;padding:10px;border:1px solid var(--line2);border-radius:8px;resize:vertical}
+  textarea.import-area:focus{outline:none;border-color:var(--teal)}
+
+  /* compromise shockwave (spawned by JS at node position) */
+  .shockwave{position:absolute;width:16px;height:16px;margin:-8px 0 0 -8px;border-radius:50%;
+    border:2px solid var(--crimson);pointer-events:none;z-index:15;
+    box-shadow:0 0 22px #b3273a66, inset 0 0 12px #b3273a38;
+    animation:shock .95s cubic-bezier(.2,.7,.3,1) forwards}
+  @keyframes shock{0%{transform:scale(.6);opacity:.95}100%{transform:scale(10);opacity:0}}
+  .shockwave.entry{border-color:var(--pathgold);box-shadow:0 0 22px #c9973f55, inset 0 0 12px #c9973f38}
+  .shockwave.contained{border-color:#5b7fa6;box-shadow:0 0 22px #5b7fa655, inset 0 0 12px #5b7fa638}
+
+  /* scrollbars */
+  ::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-track{background:transparent}
+  ::-webkit-scrollbar-thumb{background:#232a3b;border-radius:4px}::-webkit-scrollbar-thumb:hover{background:#323c52}
+
+  /* print */
+  #printSummary{display:none}
+  @media print{
+    body{display:block;overflow:visible;height:auto;background:#fff;color:#000}
+    header,main,#drawer,#recBanner,#replayHUD,#telemetryTicker,.modal-overlay{display:none!important}
+    #printSummary{display:block!important;padding:20px;color:#000}
+    #printSummary h1{font-size:20px;margin-bottom:6px}
+    #printSummary table{width:100%;border-collapse:collapse;font-size:11px;margin:10px 0}
+    #printSummary th,#printSummary td{border:1px solid #999;padding:5px 7px;text-align:left}
+  }
+  @media (max-width:1180px){ #right{width:360px;min-width:360px} #left{width:280px;min-width:280px} }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="mark">GQ</div>
+    <h1>GRAPHOPS<small>Incident Decision &amp; Blast Radius Engine · hackFront India T2</small></h1>
+  </div>
+
+  <span id="incidentStatusBadge" class="status-badge healthy">
+    <span class="dot" style="background:currentColor"></span>
+    <span id="incidentStatusText">ENTERPRISE CLEAN</span>
+  </span>
+
+  <div class="live-indicator" id="liveTelemetryBadge" title="Real-time simulated telemetry recomputation">
+    <span class="live-dot"></span>
+    <span id="telemetryStatusLabel">LIVE TELEMETRY · 0.0s</span>
+  </div>
+
+  <div class="stats">
+    <span class="chip">Reachable<b id="stat-compromised">–</b></span>
+    <span class="chip hot">Crown jewels<b id="stat-jewels">–</b></span>
+    <span class="chip warn">Path risk<b id="stat-maxrisk">–</b></span>
+    <span class="chip teal">Choke points<b id="stat-chokes">–</b></span>
+  </div>
+
+  <div class="seg" title="Graph visualization">
+    <button id="btn2d" class="on">2D</button>
+    <button id="btn3d">3D</button>
+  </div>
+  <select id="layoutSel" class="hsel" title="2D layout algorithm">
+    <option value="force">Force layout</option>
+    <option value="hier">Hierarchical</option>
+  </select>
+
+  <button class="hbtn lab" id="btnOpenContainment" title="Open Containment Simulation Lab">Containment Lab</button>
+  <button class="hbtn tests" id="btnOpenTests" title="Run 31 Automated Engine Unit Tests">Tests (31/31)</button>
+  <button class="hbtn" id="btnOpenImport" title="Import Custom JSON/CSV Graph Data">Import</button>
+  <button class="hbtn" id="btnExportJSON" title="Download blast-radius report as JSON">Export</button>
+  <button class="hbtn" id="btnPrint" title="Printable SOC Executive Brief">Print</button>
+  <button class="hbtn primary" id="btnReset">Reset</button>
+</header>
+
+<main>
+  <!-- ============ LEFT : control deck ============ -->
+  <aside id="left">
+    <div class="card">
+      <h3><span class="n">01</span>Incident Foothold &amp; Scenarios</h3>
+      <label class="f" for="presetSel">Curated attack scenarios (judges)</label>
+      <select id="presetSel" class="w"></select>
+
+      <label class="f" for="entrySel">Compromised asset / identity</label>
+      <select id="entrySel" class="w"></select>
+
+      <label class="f" for="depthSel">Max propagation depth (hops)</label>
+      <select id="depthSel" class="w">
+        <option value="1">1 hop (adjacent discovery)</option>
+        <option value="2">2 hops (internal pivot)</option>
+        <option value="3" selected>3 hops (enterprise lateral)</option>
+        <option value="4">4 hops (cross-segment penetration)</option>
+        <option value="5">5 hops (full domain traversal)</option>
+      </select>
+
+      <div class="row">
+        <button class="btn breach grow" id="btnBreach">Simulate breach</button>
+        <button class="btn replay grow" id="btnReplay" title="Play animated step-by-step attack replay">▶ Replay</button>
+      </div>
+      <button class="btn ghost" id="btnStopAnim" disabled>Stop playback</button>
+
+      <label class="chk" style="margin-top:8px">
+        <input type="checkbox" id="chkLiveTelemetry" checked>
+        <span>Stream simulated telemetry events</span>
+      </label>
+    </div>
+
+    <div class="card">
+      <h3><span class="n">02</span>Propagation Timeline</h3>
+      <input type="range" id="timeline" min="0" max="3" value="0" step="1" disabled>
+      <div class="tctl">
+        <button class="tbtn" id="btnPlay" disabled>Play</button>
+        <button class="tbtn" id="btnStepBack" disabled>&lt;</button>
+        <button class="tbtn" id="btnStepFwd" disabled>&gt;</button>
+        <select id="speedSel" class="hsel" title="Playback speed" disabled>
+          <option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option>
+        </select>
+        <span id="timelineLabel">hop 0</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3><span class="n">03</span>Quick Containment</h3>
+      <p style="font-size:11px;color:var(--muted);margin-bottom:6px">Simulate isolating key nodes before executing changes:</p>
+      <div id="quickContainmentList">
+        <label class="chk"><input type="checkbox" data-contain="sw-corp"><span>Block <b>SW-CORP</b> (Core LAN Switch)</span></label>
+        <label class="chk"><input type="checkbox" data-contain="ws-0142"><span>Isolate <b>WS-0142</b> (Phished Host)</span></label>
+        <label class="chk"><input type="checkbox" data-contain="u-alice"><span>Disable <b>alice.sharma</b> (User ID)</span></label>
+        <label class="chk"><input type="checkbox" data-contain="svc-backup"><span>Revoke <b>svc-backup</b> (Privileged SA)</span></label>
+        <label class="chk"><input type="checkbox" data-contain="vpn-gw"><span>Block <b>vpn.acme-corp.com</b> (Gateway)</span></label>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <button class="btn ghost small grow" id="btnApplyQuickContain">Simulate selected</button>
+        <button class="btn ghost small grow" id="btnClearContain">Clear</button>
+      </div>
+      <div id="quickContainStatus" style="font-size:11px;color:var(--emerald);margin-top:6px;font-family:var(--mono)"></div>
+    </div>
+
+    <div class="card">
+      <h3><span class="n">04</span>Investigate &amp; Filter</h3>
+      <label class="f" for="nodeSearch">Search assets / identities / techniques</label>
+      <input id="nodeSearch" class="w" placeholder="e.g. dc01, Alice, T1482, db01…" autocomplete="off">
+      <div id="searchMsg" style="font-size:11px;color:var(--faint);margin-top:3px"></div>
+
+      <label class="f">Filter topology</label>
+      <label class="chk"><input type="checkbox" id="flt-asset" checked><span class="dot" style="background:#a06a3c"></span>Assets (workstations, servers)</label>
+      <label class="chk"><input type="checkbox" id="flt-identity" checked><span class="dot" style="background:#c9973f"></span>Identities (users, service accounts)</label>
+      <label class="chk"><input type="checkbox" id="flt-network" checked><span class="dot" style="background:#4f7d7a"></span>Network (gateways, VLAN switches)</label>
+
+      <label class="f">Point-to-point path finder</label>
+      <div class="row">
+        <select id="pathFrom" class="w grow"></select>
+        <select id="pathTo" class="w grow"></select>
+      </div>
+      <div class="row">
+        <button class="btn ghost small grow" id="btnFindPath">Trace path</button>
+        <button class="btn ghost small grow" id="btnClearPath">Clear</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3><span class="n">05</span>Legend &amp; Topology</h3>
+      <div class="legend">
+        <div><span class="dot" style="background:#a06a3c"></span>Asset (Criticality 1–5)</div>
+        <div><span class="dot" style="background:#c9973f"></span>Identity / Service Account</div>
+        <div><span class="dot" style="background:#4f7d7a"></span>Network Fabric / Subnet</div>
+        <div><span class="dot" style="background:#b3273a"></span>Compromised (In Blast Radius)</div>
+        <div><span class="dot" style="background:#5b7fa6"></span>Contained / Quarantined</div>
+        <div><span class="dot" style="background:#c9973f"></span>Active Attack Path</div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ============ CENTER : graph visualization ============ -->
+  <section id="center">
+    <!-- Floating Incident Commander Recommendation Banner -->
+    <div id="recBanner">
+      <div class="icon">🧠</div>
+      <div class="content">
+        <div class="title">
+          <span>RECOMMENDED CONTAINMENT ACTION</span>
+          <span class="pill-rec" id="recBadge">91% RISK REDUCTION</span>
+        </div>
+        <div class="reason" id="recReason">Block SW-CORP · Separates 2 attack paths · Protects 2 crown jewels</div>
+      </div>
+      <button id="btnApplyRec">Simulate Action</button>
+    </div>
+
+    <!-- Floating Attack Replay HUD -->
+    <div id="replayHUD">
+      <div class="time" id="replayTime">00:00</div>
+      <div class="step-text" id="replayStep">Initial foothold established</div>
+      <div class="tech-badge" id="replayTech">T1566 Phishing</div>
+    </div>
+
+    <!-- Floating Live Telemetry Ticker -->
+    <div id="telemetryTicker">
+      <span class="tag">TELEMETRY</span>
+      <span class="event" id="tickerEvent">Enterprise nominal · Zero uncontained active lateral movements.</span>
+    </div>
+
+    <div id="net2d"></div>
+    <div id="net3d"></div>
+
+    <div id="cdnError"><div class="box">
+      <h2>Graph library failed to load</h2>
+      <p>The vis-network CDN (<span style="font-family:var(--mono)">unpkg.com</span>) could not be reached.
+      Check your internet connection and reload. GraphOps runs 100% locally in your browser.</p>
+    </div></div>
+
+    <!-- Node & Edge Inspector Drawer -->
+    <div id="drawer">
+      <button id="drawerClose" title="Close drawer">×</button>
+      <h2 id="drawerTitle">Asset Details</h2>
+      <div class="gsub" id="drawerSub"></div>
+      <div id="drawerBody"></div>
+
+      <div id="drawerNodeControls">
+        <label class="f" for="critSel">Business criticality (1–5) — rescales risk live</label>
+        <select id="critSel" class="w">
+          <option value="1">1 — Negligible impact</option>
+          <option value="2">2 — Low impact</option>
+          <option value="3">3 — Medium impact</option>
+          <option value="4">4 — High enterprise value</option>
+          <option value="5">5 — Tier-0 Crown Jewel</option>
+        </select>
+        <button class="btn ghost" id="btnDrawerContain">Simulate quarantine of this node</button>
+        <button class="btn ghost" id="btnHighlightPath">Highlight attack path to here</button>
+        <button class="btn ghost" id="btnIsolate">Collapse / expand neighbourhood</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ RIGHT : incident decision & analytics tabs ============ -->
+  <aside id="right">
+    <div class="tabs">
+      <button id="tab-blast" class="on">Blast Radius</button>
+      <button id="tab-paths">Attack Paths</button>
+      <button id="tab-lab">Containment Lab</button>
+      <button id="tab-story">Threat Story</button>
+      <button id="tab-mitre">MITRE</button>
+      <button id="tab-analytics">Analytics</button>
+      <button id="tab-guide">Guide</button>
+    </div>
+
+    <div class="tabbody">
+      <!-- 1. Blast Radius -->
+      <div class="tabpage on" id="panel-blast">
+        <div id="blastList">
+          <div class="empty">No breach simulated yet.<br>Select an entry point and hit <b>Simulate breach</b>.</div>
+        </div>
+      </div>
+
+      <!-- 2. Attack Paths & Next Target Prediction -->
+      <div class="tabpage" id="panel-paths">
+        <div id="pathsContent">
+          <div class="empty">Run a breach simulation to see BloodHound-style paths, predicted next moves, and choke points.</div>
+        </div>
+      </div>
+
+      <!-- 3. Containment Lab -->
+      <div class="tabpage" id="panel-lab">
+        <div id="containmentLabContent">
+          <div class="empty">Simulate a breach first, then test containment actions to measure risk reduction.</div>
+        </div>
+      </div>
+
+      <!-- 4. Threat Story & Graph Diff -->
+      <div class="tabpage" id="panel-story">
+        <div id="threatStoryContent">
+          <div class="empty">Simulate a breach to generate the deterministic incident narrative and scenario graph diff.</div>
+        </div>
+      </div>
+
+      <!-- 5. MITRE ATT&CK Matrix -->
+      <div class="tabpage" id="panel-mitre">
+        <div id="mitreContent">
+          <div class="empty">MITRE ATT&amp;CK techniques observed during traversal will appear here with interactive path highlighting.</div>
+        </div>
+      </div>
+
+      <!-- 6. Analytics & Engine Benchmarks -->
+      <div class="tabpage" id="panel-analytics">
+        <div id="chartsFallback"></div>
+        <div class="chartTitle">Risk-score distribution</div><div class="chart" id="chartRisk"></div>
+        <div class="chartTitle">Compromise timeline (nodes per hop)</div><div class="chart" id="chartTimeline"></div>
+        <div class="chartTitle">MITRE technique frequency</div><div class="chart" id="chartTech"></div>
+        <div class="chartTitle">Live Engine Performance Benchmark</div>
+        <div id="benchmarkBox" style="background:#090d16;border:1px solid var(--line2);border-radius:8px;padding:10px;font-family:var(--mono);font-size:11px;line-height:1.7">
+          Loading engine benchmark…
+        </div>
+      </div>
+
+      <!-- 7. Guide -->
+      <div class="tabpage guide" id="panel-guide">
+        <h4>What is GraphOps?</h4>
+        <p>GraphOps is an incident-time graph reasoning engine: from <i>"Something is compromised"</i> to <i>"Here is exactly what the attacker can reach, why, and what to contain."</i></p>
+        <p>Rather than a static graph viewer, GraphOps turns scattered telemetry into one incident picture, simulates attacker reachability via <b>bounded weighted path propagation</b>, identifies critical choke points, predicts the adversary's next move, and lets analysts test containment defensive actions before taking action.</p>
+
+        <h4>Winning Demo in 4 Steps (90 Seconds)</h4>
+        <ol>
+          <li><b>Preset 1:</b> Select <code>Scenario 1 — Compromised Workstation</code> and hit <b>Simulate breach</b>. Watch the attack tree ignite hop-by-hop with shockwave pulses.</li>
+          <li><b>Attack Paths:</b> Click the <code>Attack Paths</code> tab. Both Crown Jewels (Domain Controller &amp; Customer DB) fall at depth 2–3. Note the <b>Predicted Next Move</b> (DC01 at 87% confidence).</li>
+          <li><b>Containment Lab:</b> Click <b>Containment Lab</b>. GraphOps ranks defensive actions by % Risk Reduction. Observe <code>Block SW-CORP (91% Risk Reduction)</code>.</li>
+          <li><b>Verify Decision:</b> Hit <code>Simulate Action</code>. Watch the graph partition: crown jewels exposed drops from <b>2/2 → 0/2</b>, blast radius shrinks from <b>28 → 4</b>. Zero guessing.</li>
+        </ol>
+
+        <h4>Defensible Engineering</h4>
+        <ul>
+          <li><b>Bounded Weighted Path Propagation:</b> DP-based path score optimization incorporating edge attractiveness, technique weights, identity privileges, and asset criticality.</li>
+          <li><b>Explainable Edges:</b> Every link has typed relationships, MITRE techniques, confidence, and technical evidence.</li>
+          <li><b>Zero-Install &amp; 100% Client-Side:</b> Zero external telemetry, zero backend storage, runs fully local in your browser.</li>
+        </ul>
+      </div>
+    </div>
+  </aside>
+</main>
+
+<!-- Modals -->
+<!-- 1. Automated Test Suite Modal -->
+<div class="modal-overlay" id="modalTests">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h3><span>🧪</span> GraphOps Engine Unit Test Suite (31 Tests)</h3>
+      <button class="modal-close" id="btnCloseTests">×</button>
+    </div>
+    <div class="modal-body">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <span style="font-size:12px;color:var(--muted)">Executes pure headless unit tests directly against <code>engine.js</code>:</span>
+        <button class="btn ghost small" id="btnRerunTests">Run Tests</button>
+      </div>
+      <div id="testResultsOutput" style="font-family:var(--mono);font-size:11.5px;background:#0d0b09;padding:12px;border:1px solid var(--line2);border-radius:8px;max-height:380px;overflow-y:auto;line-height:1.7">
+        Click 'Run Tests' to execute the 31-test suite…
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 2. Data Ingestion Modal (JSON / CSV) -->
+<div class="modal-overlay" id="modalImport">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h3><span>📥</span> Import Enterprise Topology (JSON / CSV)</h3>
+      <button class="modal-close" id="btnCloseImport">×</button>
+    </div>
+    <div class="modal-body">
+      <p style="font-size:11.5px;color:var(--muted);margin-bottom:8px">Paste custom enterprise topology JSON or CSV. GraphOps validates node references, cycles, and techniques before execution:</p>
+      <div class="row" style="margin-bottom:8px">
+        <button class="btn ghost small" id="btnLoadSampleJSON">Load Sample JSON</button>
+        <button class="btn ghost small" id="btnLoadSampleCSV">Load Sample CSV</button>
+        <button class="btn ghost small" id="btnResetToDefaultGraph">Reset to Acme Default</button>
+      </div>
+      <textarea class="import-area" id="importInput" placeholder='Paste JSON {"nodes": [...], "edges": [...]} or CSV here...'></textarea>
+      <div id="importValidationStatus" style="font-size:11.5px;margin-top:8px;font-family:var(--mono)"></div>
+      <button class="btn primary" id="btnExecuteImport" style="margin-top:10px">Validate &amp; Ingest Graph</button>
+    </div>
+  </div>
+</div>
+
+<div id="printSummary"></div>
+
+<!-- CDN Scripts with Graceful Fallbacks -->
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<script src="https://unpkg.com/3d-force-graph@1.72.2/dist/3d-force-graph.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+<script src="data.js"></script>
+<script src="engine.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
